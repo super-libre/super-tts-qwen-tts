@@ -1,0 +1,160 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }} ${{ matrix.suffix }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One build per (target, accelerator). CubeCL compiles kernels at
+          # runtime, so there is no compute-capability axis: what used to be
+          # twelve CUDA builds is two, one per CUDA major version.
+          #
+          # `features` is passed with `--no-default-features`, so each build
+          # carries exactly one backend rather than its own plus the default
+          # `flex`.
+
+          # CPU (x86_64) — the pure-Rust backend, which runs anywhere. Usable,
+          # but the talker is a transformer: expect slower than real time.
+          - {
+              target: x86_64-unknown-linux-gnu,
+              suffix: cpu,
+              features: flex,
+              image: "",
+            }
+
+          # CUDA. Built inside the nvidia/cuda devel image (carries nvcc and
+          # the headers `cubecl-hip-sys`'s CUDA counterpart reads the version
+          # from) via cross's image override.
+          - {
+              target: x86_64-unknown-linux-gnu,
+              suffix: cuda12,
+              features: cuda,
+              image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04",
+            }
+          - {
+              target: x86_64-unknown-linux-gnu,
+              suffix: cuda13,
+              features: cuda,
+              image: "nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04",
+            }
+
+          # ROCm. The image has to carry the ROCm version `cubecl-hip-sys`
+          # binds — 7.1 as pinned today — so this tag moves with that crate.
+          - {
+              target: x86_64-unknown-linux-gnu,
+              suffix: rocm,
+              features: rocm,
+              image: "rocm/dev-ubuntu-24.04:7.1.1",
+            }
+
+          # Vulkan: no SDK needed to build, the loader is found at runtime.
+          - {
+              target: x86_64-unknown-linux-gnu,
+              suffix: vulkan,
+              features: vulkan,
+              image: "",
+            }
+
+          # CPU (aarch64) — cross-compiled. No CUDA or ROCm on ARM here, and
+          # Vulkan is left out until there is a runner to test it on.
+          - {
+              target: aarch64-unknown-linux-gnu,
+              suffix: cpu,
+              features: flex,
+              image: "",
+            }
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-${{ matrix.suffix }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      # The CUDA and ROCm builds run inside their vendor's devel image, which
+      # carries the toolkit headers those backends bind against, selected
+      # per-target via cross's image override. Everything else uses cross's
+      # default images. No GPU is needed at build time and no compute
+      # capability is chosen: CubeCL compiles the kernels on the host that runs
+      # them.
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.image }}" ]; then
+            export CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE="${{ matrix.image }}"
+          fi
+          cross build --release --locked --target ${{ matrix.target }} \
+            --no-default-features --features "${{ matrix.features }}" \
+            --bin super-tts-backend-qwen-tts
+
+      # `kernels/` rides along with the binary. It holds the pre-warmed autotune
+      # cache, which is the slow half of a first load — about four minutes on an
+      # RTX 3090, against under one for the compiling alone. Under a megabyte,
+      # and every namespace in it carries a device fingerprint, so the entries a
+      # machine cannot use are never looked up: one file covers every GPU it was
+      # warmed on and costs the others nothing. Shipped in every tarball,
+      # including the CPU one, rather than matched per accelerator.
+      - name: Create tarball
+        run: |
+          tar -czf "qwen-tts-${{ matrix.target }}-${{ matrix.suffix }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" super-tts-backend-qwen-tts \
+            -C "$GITHUB_WORKSPACE" kernels
+          ls -lh qwen-tts-*.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qwen-tts-${{ matrix.target }}-${{ matrix.suffix }}
+          path: qwen-tts-${{ matrix.target }}-${{ matrix.suffix }}.tar.gz
+
+  create-release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      # backend.toml must ship as a release asset named exactly `backend.toml`:
+      # the super-tts indexer hashes these bytes into the registry's `manifest`
+      # pin, and the daemon verifies the installed manifest against that hash
+      # (reviewed == pinned == installed). Without it, the indexer falls back to
+      # un-pinned repo-source indexing. Checkout brings the tag's backend.toml
+      # into the workspace — the build tarballs don't carry it.
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            backend.toml
+            artifacts/**/*.tar.gz
+          generate_release_notes: true

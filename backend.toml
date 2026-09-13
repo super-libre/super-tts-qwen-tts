@@ -1,0 +1,412 @@
+#:schema https://jorge-menjivar.github.io/super-tts/backend.schema.json
+# Qwen text-to-speech for Super TTS.
+#
+# The backend is named for the family, the models for their generation: a later
+# generation joins the `[[models]]` list below rather than forking the repo, and
+# the two then coexist under one installed backend.
+#
+# Every file below is fetched by the daemon before the first `POST /v1/load`:
+# the backend runs with `PrivateNetwork=yes` and a read-only backend directory,
+# so it can neither download nor write a weight itself. Only the selected
+# model's files are fetched, so declaring three models costs a user nothing
+# beyond the one they load.
+
+[backend]
+    id = "app.super-tts.qwen-tts"
+    source = "github.com/jorge-menjivar/super-tts-qwen-tts"
+    name = "Qwen TTS"
+    version = "0.1.0"
+    kind = "subprocess"
+    entrypoint = "super-tts-backend-qwen-tts"
+    contract = "v1"
+    license = "GPL-3.0-only"
+    description = "Qwen local text-to-speech, 24 kHz, 10 languages. Serves the Qwen3-TTS checkpoints: nine preset voices, or a voice built from a description."
+
+[network]
+    # Required to be empty for subprocess backends; the transport has no network.
+    allowed_hosts = []
+
+# The voice for the VoiceDesign checkpoint, which is the one model here that has
+# no speakers of its own — it builds a voice from a sentence describing it. Every
+# other model ignores both options: a CustomVoice checkpoint conditions on one of
+# its nine speakers and a Base one on a clone, so neither has anywhere to put a
+# description, and handing one a description the user set for a different model
+# would refuse every request rather than sound different.
+#
+# These are options rather than `[[models.voices]]` because a description is not
+# a voice id the daemon can validate: the twelve below are a starting point, not
+# the set of voices the checkpoint has. `voice_kinds = ["described"]` is what
+# still lets a caller pass its own `desc:<text>` per request, and a request that
+# does wins over both of these — see src/voices.rs.
+
+[[options]]
+    name = "voice_design_preset"
+    label = "Designed voice"
+    description = "The voice the Voice Design model builds. Ignored by the other models, which speak with a preset or a cloned voice."
+    type = "string"
+    default = "Neutral narrator (female)"
+    # The names, not the descriptions: an option's `choices` are the values the
+    # daemon stores and the dropdown shows, and twelve sentences in a picker is
+    # not a picker. src/voices.rs holds the description each one stands for, and
+    # a test there asserts this list and that table are the same twelve.
+    #
+    # Each name says whether the voice is female or male, the way the nine
+    # CustomVoice speakers below do, because the name is the whole of what the
+    # picker shows — six of each, and the description behind each one says it
+    # again, since that is the half the model actually reads.
+    choices = [
+        "Neutral narrator (female)",
+        "Warm storyteller (female)",
+        "Deep narrator (male)",
+        "Bright presenter (female)",
+        "Calm documentary (male)",
+        "Friendly assistant (male)",
+        "News anchor (male)",
+        "Gravelly veteran (male)",
+        "Soft whisper (female)",
+        "Cheerful child (female)",
+        "Elegant host (female)",
+        "Dramatic trailer (male)",
+    ]
+
+# Deliberately without `choices`: this is the free-text half, and declaring any
+# would turn it into a second dropdown and refuse every voice a user wrote.
+[[options]]
+    name = "voice_design_description"
+    label = "Custom voice description"
+    description = "Describe the voice in your own words, e.g. 'A hoarse, weary sailor speaking slowly'. Overrides the designed voice above whenever it is set; clear it to go back to the list."
+    type = "string"
+
+# One entry per tarball `.github/workflows/release.yml` builds — the filenames
+# must match it exactly, since the indexer resolves them against the release's
+# assets and pins their hashes. The archives hold the binary at their root,
+# which is where `entrypoint` above says to find it.
+#
+# One build per (target, accelerator). There is no compute-capability axis:
+# Burn compiles every kernel at runtime through CubeCL — NVRTC on CUDA, hiprtc
+# on ROCm, SPIR-V on Vulkan — so one CUDA build serves every NVIDIA generation
+# the installed driver can compile for, where an ahead-of-time build needs one
+# asset per SM. What is left is the CUDA major version, which decides the API
+# the binary was built against.
+
+[[assets.subprocess]]
+    file = "qwen-tts-x86_64-unknown-linux-gnu-cpu.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel = "cpu"
+
+[[assets.subprocess]]
+    file = "qwen-tts-x86_64-unknown-linux-gnu-cuda12.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel = "cuda"
+    cuda_major = 12
+    # No `cuda_sm`: the kernels are compiled on the host by NVRTC, so this
+    # build matches any compute capability, which is what omitting it declares.
+
+[[assets.subprocess]]
+    file = "qwen-tts-x86_64-unknown-linux-gnu-cuda13.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel = "cuda"
+    cuda_major = 13
+
+# AMD. The kernels are compiled at runtime here too, so this list is not the
+# set of architectures the binary carries code for — it is the set the backend
+# is claimed to work on, which the schema requires to be explicit because an
+# ahead-of-time HIP build could not honestly claim more. RDNA2 through RDNA4
+# and the CDNA parts; a card outside it will usually work and is simply not
+# advertised.
+[[assets.subprocess]]
+    file = "qwen-tts-x86_64-unknown-linux-gnu-rocm.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel = "rocm"
+    gfx = [
+        "gfx90a",
+        "gfx942",
+        "gfx1030",
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1200",
+        "gfx1201",
+    ]
+
+# The vendor-neutral GPU path: Intel, an AMD card on the Mesa driver, an NVIDIA
+# card without CUDA installed. Slower than the native backends, and ranked
+# below them by the daemon, but it is the only GPU some hosts have.
+#
+# The 1.2 floor is the sampling kernel's: it reduces across a plane, and the
+# subgroup types that needs are core in Vulkan 1.2 (CubeCL reaches for
+# `VK_KHR_shader_subgroup_extended_types` below it).
+[[assets.subprocess]]
+    file = "qwen-tts-x86_64-unknown-linux-gnu-vulkan.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel = "vulkan"
+    vulkan_api = "1.2"
+
+[[assets.subprocess]]
+    file = "qwen-tts-aarch64-unknown-linux-gnu-cpu.tar.gz"
+    target = "aarch64-unknown-linux-gnu"
+    accel = "cpu"
+
+# ---------------------------------------------------------------------------
+# The 0.6B CustomVoice checkpoint: the default. Nine voices, ten languages, and
+# the smallest of the three, which is what makes it the one worth trying on a
+# machine with no GPU.
+# ---------------------------------------------------------------------------
+
+[[models]]
+    name = "qwen3-tts-0.6b-custom-voice"
+    multilingual = true
+    primary_language = "en"
+    # The ten languages the talker's `codec_language_id` table names, as BCP-47
+    # codes; src/lang.rs holds the join and a test asserts the two agree. The
+    # Beijing and Sichuan dialects are not listed: the reference implementation
+    # selects them through the speaker (`dylan`, `eric`), not the language.
+    supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
+    supported_devices = ["cpu", "gpu"]
+    # The weights (1.8 GB) plus the codec (0.7 GB) in bf16, with room for the
+    # KV cache of a long utterance. Deliberately conservative: the daemon uses
+    # this to decide whether a GPU can hold the model at all.
+    estimated_vram_bytes = 3758096384
+    # The talker puts the whole text in its prefix and generates until it emits
+    # end-of-speech, so a chunk this size is about half a minute of speech —
+    # well inside the 164-second cap in src/model.rs.
+    max_input_chars = 500
+    output_sample_rate = 24000
+    default_voice = "ryan"
+    # Preset only: this checkpoint conditions on one of its own speakers. It
+    # ignores `instructions` — the 0.6B models were not trained on them and the
+    # reference implementation drops them.
+    voice_kinds = ["preset"]
+    files = [
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/config.json", destination = "models/qwen3-tts-0.6b-custom-voice/config.json", sha256 = "81aca2b6fac304944d8acf345272d8a9a727d5fc2e2e66b222ab4729340c7455" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/model.safetensors", destination = "models/qwen3-tts-0.6b-custom-voice/model.safetensors", sha256 = "bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/speech_tokenizer/config.json", destination = "models/qwen3-tts-0.6b-custom-voice/speech_tokenizer/config.json", sha256 = "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice/resolve/main/speech_tokenizer/model.safetensors", destination = "models/qwen3-tts-0.6b-custom-voice/speech_tokenizer/model.safetensors", sha256 = "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258" },
+        # The TTS repositories ship `vocab.json` and `merges.txt` but no
+        # assembled `tokenizer.json`, and the vocabulary is Qwen3's own — which
+        # is why the reference candle example reads it from `Qwen/Qwen3-0.6B`.
+        { url = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json", destination = "models/qwen3-tts-0.6b-custom-voice/tokenizer.json", sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
+    ]
+
+    [[models.voices]]
+        id = "ryan"
+        label = "Ryan (English, male)"
+        language = "en"
+        tags = ["english", "male", "dynamic"]
+
+    [[models.voices]]
+        id = "aiden"
+        label = "Aiden (American, male)"
+        language = "en"
+        tags = ["english", "american", "male"]
+
+    [[models.voices]]
+        id = "vivian"
+        label = "Vivian (Mandarin, female)"
+        language = "zh"
+        tags = ["mandarin", "female", "bright"]
+
+    [[models.voices]]
+        id = "serena"
+        label = "Serena (Mandarin, female)"
+        language = "zh"
+        tags = ["mandarin", "female", "warm"]
+
+    [[models.voices]]
+        id = "uncle_fu"
+        label = "Uncle Fu (Mandarin, male)"
+        language = "zh"
+        tags = ["mandarin", "male", "mellow"]
+
+    [[models.voices]]
+        id = "dylan"
+        label = "Dylan (Beijing Mandarin, male)"
+        language = "zh"
+        tags = ["mandarin", "beijing", "male"]
+
+    [[models.voices]]
+        id = "eric"
+        label = "Eric (Sichuan Mandarin, male)"
+        language = "zh"
+        tags = ["mandarin", "sichuan", "male"]
+
+    [[models.voices]]
+        id = "ono_anna"
+        label = "Ono Anna (Japanese, female)"
+        language = "ja"
+        tags = ["japanese", "female", "playful"]
+
+    [[models.voices]]
+        id = "sohee"
+        label = "Sohee (Korean, female)"
+        language = "ko"
+        tags = ["korean", "female", "warm"]
+
+# ---------------------------------------------------------------------------
+# The 1.7B CustomVoice checkpoint: the same nine voices, better prosody, and it
+# does read `instructions`.
+# ---------------------------------------------------------------------------
+
+[[models]]
+    name = "qwen3-tts-1.7b-custom-voice"
+    multilingual = true
+    primary_language = "en"
+    supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
+    supported_devices = ["cpu", "gpu"]
+    # 3.8 GB of weights plus the 0.7 GB codec, in bf16, with KV-cache headroom.
+    estimated_vram_bytes = 6442450944
+    max_input_chars = 500
+    output_sample_rate = 24000
+    default_voice = "ryan"
+    # Preset: the voice is still one of the nine. Unlike the 0.6B checkpoint,
+    # this one takes `instructions` as delivery guidance on top of the voice.
+    voice_kinds = ["preset"]
+    files = [
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/main/config.json", destination = "models/qwen3-tts-1.7b-custom-voice/config.json", sha256 = "17a07f527a1c25ea30b4e023a184482a23d3e279d697b1dc81b1bde498d29cf9" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/main/model.safetensors", destination = "models/qwen3-tts-1.7b-custom-voice/model.safetensors", sha256 = "38b1d5971bdbd982b561cccec982669a53b0537c3cf5e9bd4778ed07bb2f5137" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/main/speech_tokenizer/config.json", destination = "models/qwen3-tts-1.7b-custom-voice/speech_tokenizer/config.json", sha256 = "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/resolve/main/speech_tokenizer/model.safetensors", destination = "models/qwen3-tts-1.7b-custom-voice/speech_tokenizer/model.safetensors", sha256 = "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258" },
+        { url = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json", destination = "models/qwen3-tts-1.7b-custom-voice/tokenizer.json", sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
+    ]
+
+    [[models.voices]]
+        id = "ryan"
+        label = "Ryan (English, male)"
+        language = "en"
+        tags = ["english", "male", "dynamic"]
+
+    [[models.voices]]
+        id = "aiden"
+        label = "Aiden (American, male)"
+        language = "en"
+        tags = ["english", "american", "male"]
+
+    [[models.voices]]
+        id = "vivian"
+        label = "Vivian (Mandarin, female)"
+        language = "zh"
+        tags = ["mandarin", "female", "bright"]
+
+    [[models.voices]]
+        id = "serena"
+        label = "Serena (Mandarin, female)"
+        language = "zh"
+        tags = ["mandarin", "female", "warm"]
+
+    [[models.voices]]
+        id = "uncle_fu"
+        label = "Uncle Fu (Mandarin, male)"
+        language = "zh"
+        tags = ["mandarin", "male", "mellow"]
+
+    [[models.voices]]
+        id = "dylan"
+        label = "Dylan (Beijing Mandarin, male)"
+        language = "zh"
+        tags = ["mandarin", "beijing", "male"]
+
+    [[models.voices]]
+        id = "eric"
+        label = "Eric (Sichuan Mandarin, male)"
+        language = "zh"
+        tags = ["mandarin", "sichuan", "male"]
+
+    [[models.voices]]
+        id = "ono_anna"
+        label = "Ono Anna (Japanese, female)"
+        language = "ja"
+        tags = ["japanese", "female", "playful"]
+
+    [[models.voices]]
+        id = "sohee"
+        label = "Sohee (Korean, female)"
+        language = "ko"
+        tags = ["korean", "female", "warm"]
+
+# ---------------------------------------------------------------------------
+# The 1.7B VoiceDesign checkpoint: no speakers at all. The voice is written out
+# in words and the model builds it, which is the `described` voice kind.
+# ---------------------------------------------------------------------------
+
+[[models]]
+    name = "qwen3-tts-1.7b-voice-design"
+    multilingual = true
+    primary_language = "en"
+    supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
+    supported_devices = ["cpu", "gpu"]
+    estimated_vram_bytes = 6442450944
+    max_input_chars = 500
+    output_sample_rate = 24000
+    # Described only, so there are no `[[models.voices]]` and no `default_voice`
+    # to name. A voice id is `desc:` followed by the description, e.g.
+    # `desc:A calm, deep male voice speaking slowly.` A request that names no
+    # voice — which is every request the settings app sends, since its voice
+    # picker has no `[[models.voices]]` here to offer — gets the voice the two
+    # `[[options]]` at the top of this file are set to, and the neutral
+    # description in src/voices.rs when they are set to nothing. A prompt with no
+    # instruction at all leaves the voice to the sampler, and it would then
+    # differ from one request to the next.
+    voice_kinds = ["described"]
+    files = [
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/config.json", destination = "models/qwen3-tts-1.7b-voice-design/config.json", sha256 = "aecd2cc4c1fe9edef1cb7ca7c401685a43879ad43f3f9e883f1c6760b61731e0" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/model.safetensors", destination = "models/qwen3-tts-1.7b-voice-design/model.safetensors", sha256 = "391e8db219f292c515297cdceeb43e4eae67cdde35fa57e79a6a8a532fca0522" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/speech_tokenizer/config.json", destination = "models/qwen3-tts-1.7b-voice-design/speech_tokenizer/config.json", sha256 = "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/speech_tokenizer/model.safetensors", destination = "models/qwen3-tts-1.7b-voice-design/speech_tokenizer/model.safetensors", sha256 = "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258" },
+        { url = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json", destination = "models/qwen3-tts-1.7b-voice-design/tokenizer.json", sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
+    ]
+
+# The Base checkpoints, which are the family that clones. They have no speakers
+# of their own and take no description: a request names a voice the user cloned,
+# and the daemon has pushed its reference recording over `POST /v1/voices`
+# before the first synthesis that names it. A Base checkpoint asked for no voice
+# at all speaks in whatever voice the sampler wanders into, which is why there
+# is no `default_voice` here — the backend refuses instead.
+#
+# `clone_needs_transcript` is deliberately unset. Both ways of cloning are
+# implemented: the speaker embedding alone, and, when the stored voice has a
+# transcript, that recording fed back as an in-context example the way the
+# reference implementation does it. Setting the flag would make the daemon
+# refuse a clip stored without words, which is a voice this backend can serve.
+[[models]]
+    name = "qwen3-tts-0.6b-base"
+    multilingual = true
+    primary_language = "en"
+    supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
+    supported_devices = ["cpu", "gpu"]
+    # Same weights as the CustomVoice checkpoint of this size, plus the codec's
+    # encoder and the speaker encoder — both small next to the talker.
+    estimated_vram_bytes = 3758096384
+    max_input_chars = 500
+    output_sample_rate = 24000
+    # Fifteen seconds of reference audio. Long enough for a speaker embedding to
+    # settle, and short enough that the in-context example it also becomes — 188
+    # codec frames — does not crowd the prefix of every sentence that follows.
+    voice_kinds = ["cloned"]
+    clone_ref_seconds = 15.0
+    files = [
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/config.json", destination = "models/qwen3-tts-0.6b-base/config.json", sha256 = "2e714c787c8edb98b05432685cddb634add2de4d4e645f653d68251ef72ba011" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/model.safetensors", destination = "models/qwen3-tts-0.6b-base/model.safetensors", sha256 = "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/speech_tokenizer/config.json", destination = "models/qwen3-tts-0.6b-base/speech_tokenizer/config.json", sha256 = "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/speech_tokenizer/model.safetensors", destination = "models/qwen3-tts-0.6b-base/speech_tokenizer/model.safetensors", sha256 = "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258" },
+        { url = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json", destination = "models/qwen3-tts-0.6b-base/tokenizer.json", sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
+    ]
+
+[[models]]
+    name = "qwen3-tts-1.7b-base"
+    multilingual = true
+    primary_language = "en"
+    supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
+    supported_devices = ["cpu", "gpu"]
+    # 3.8 GB of weights plus the 0.7 GB codec, in bf16, with KV-cache headroom.
+    estimated_vram_bytes = 6442450944
+    max_input_chars = 500
+    output_sample_rate = 24000
+    voice_kinds = ["cloned"]
+    clone_ref_seconds = 15.0
+    files = [
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/config.json", destination = "models/qwen3-tts-1.7b-base/config.json", sha256 = "b4f01752d15a488abde3e1ab44723ae4f4b9e68a4037257b098b3737893cc1f9" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/model.safetensors", destination = "models/qwen3-tts-1.7b-base/model.safetensors", sha256 = "38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/speech_tokenizer/config.json", destination = "models/qwen3-tts-1.7b-base/speech_tokenizer/config.json", sha256 = "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167" },
+        { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/speech_tokenizer/model.safetensors", destination = "models/qwen3-tts-1.7b-base/speech_tokenizer/model.safetensors", sha256 = "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258" },
+        { url = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json", destination = "models/qwen3-tts-1.7b-base/tokenizer.json", sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
+    ]

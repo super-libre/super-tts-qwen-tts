@@ -1,0 +1,46 @@
+Super TTS — Qwen TTS backend
+Copyright (C) 2026 Jorge Menjivar <jorge@menjivar.ai>
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+This backend derives from the third-party work below. Nothing in this list is
+redistributed in this repository or in its release archives: the model code is
+compiled in from a pinned dependency, and the weights are downloaded by the
+Super TTS daemon on the user's machine.
+
+
+## candle — Apache-2.0 / MIT
+
+Copyright (c) 2023 Hugging Face. https://github.com/huggingface/candle
+
+The inference framework, and the Qwen3-TTS model itself: the talker, the code
+predictor, the 12 Hz codec encoder and decoder, and the ECAPA-TDNN speaker
+encoder live in `candle-transformers::models::qwen3_tts`. This backend supplies
+the file layout, the protocol, and the streaming, and calls that model for
+everything else. A later Qwen generation served here would come from that crate
+the same way.
+
+It is pinned to https://github.com/jorge-menjivar/candle at revision
+8803b62d16965211e777e6ca9232d70cf81b11f6, which is upstream candle plus the
+`qwen3_tts` module. `src/model.rs` follows the structure of that revision's
+`candle-examples/examples/qwen3-tts/main.rs`, in particular the chunked decode
+with left context that makes streamed audio identical to a single decode.
+
+
+## Fetched at runtime, not redistributed here
+
+These are downloaded by the Super TTS daemon on the user's machine before first
+use, under their own terms; no part of them is contained in this repository or
+its release archives.
+
+  * The Qwen3-TTS checkpoints this version serves —
+    `Qwen3-TTS-12Hz-0.6B-CustomVoice`,
+    `Qwen3-TTS-12Hz-1.7B-CustomVoice` and `Qwen3-TTS-12Hz-1.7B-VoiceDesign`,
+    each with the Qwen3-TTS-Tokenizer-12Hz codec — from
+    https://huggingface.co/Qwen. Apache-2.0. Copyright Alibaba Cloud, Qwen team.
+  * The `tokenizer.json` of https://huggingface.co/Qwen/Qwen3-0.6B, Apache-2.0.
+    The TTS repositories ship `vocab.json` and `merges.txt` but no assembled
+    tokenizer, and the two vocabularies are the same one.

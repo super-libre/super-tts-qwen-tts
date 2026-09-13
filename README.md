@@ -1,0 +1,377 @@
+# Super TTS — Qwen TTS backend
+
+[![coverage](https://img.shields.io/endpoint?url=https://jorge-menjivar.github.io/super-tts-qwen-tts/coverage.json)](https://jorge-menjivar.github.io/super-tts-qwen-tts/)
+
+Qwen's text-to-speech models as a subprocess backend for
+[Super TTS](https://github.com/jorge-menjivar/super-tts). Ten languages, 24 kHz
+output, nine preset voices — or no preset voice at all, and a voice written out
+in words instead.
+
+The backend is named for the family and the models for their generation. Today
+it serves [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS); a later generation
+is a new entry in `backend.toml` rather than a new repository, and the two would
+sit side by side under one installed backend.
+
+## What it is
+
+The Super TTS daemon does not compile model inference in-tree. It discovers
+backends on disk and drives each one over a `/v1` HTTP contract on a Unix
+socket. This is one such backend: a single binary that runs the models through
+[Burn](https://github.com/tracel-ai/burn) and answers `POST /v1/synthesize`
+with framed PCM.
+
+Burn is what makes this the widest-reaching backend here. Its kernels are
+compiled at runtime by CubeCL, so one binary per accelerator covers every GPU
+generation the driver can compile for — and the accelerators include ROCm and
+Vulkan, which the candle-based backends cannot reach at all.
+
+Synthesis has two halves, and the split is why speech starts before the
+utterance is finished:
+
+```
+daemon ──POST /v1/synthesize──▶ talker ──▶ 12.5 frames/s of 16 codec tokens
+                                                                  │
+                                                                  ▼
+       ◀── [audio][audio]…[mark][done] ──── codec decoder ──▶ 24 kHz audio
+```
+
+The talker generates one frame at a time, so audio is decoded and sent in
+two-second chunks while the rest is still being generated. Each chunk is decoded
+together with the 50 frames before it, whose audio is then discarded, which
+makes the streamed result sample-for-sample what a single decode would have
+produced. Without that context the chunk seams are audible.
+
+## Models
+
+Five Qwen3-TTS checkpoints, one loaded at a time. Only the selected model's
+files are downloaded, so the others cost nothing.
+
+| Model | Voices | Size on disk | `instructions` |
+|---|---|---|---|
+| `qwen3-tts-0.6b-custom-voice` | nine presets | 2.5 GB | ignored |
+| `qwen3-tts-1.7b-custom-voice` | nine presets | 4.5 GB | honored |
+| `qwen3-tts-1.7b-voice-design` | described | 4.5 GB | honored |
+| `qwen3-tts-0.6b-base` | cloned | 2.5 GB | ignored |
+| `qwen3-tts-1.7b-base` | cloned | 4.5 GB | honored |
+
+All five speak German, English, Spanish, French, Italian, Japanese, Korean,
+Portuguese, Russian and Chinese.
+
+The nine preset voices are `ryan` and `aiden` (English), `vivian`, `serena` and
+`uncle_fu` (Mandarin), `dylan` (Beijing) and `eric` (Sichuan), `ono_anna`
+(Japanese), and `sohee` (Korean). Each sounds best in its own language. The two
+dialects are selected by the speaker rather than by the language, which is what
+the reference implementation does.
+
+### Designed voices
+
+The VoiceDesign model has no preset voices. Its voice ids are a description:
+
+```
+desc:A calm, deep male voice, speaking slowly with a warm tone.
+```
+
+The settings app's voice picker cannot send one — it offers a model's declared
+voices, and this model declares none — so the description comes from the
+backend's own settings instead. Two options sit beside each other there:
+
+| Option | Shape | What it does |
+|---|---|---|
+| `voice_design_preset` | dropdown | One of twelve pre-made voices — *Neutral narrator (female)*, *Gravelly veteran (male)*, and ten more, six of each gender. Each name says which, because the name is all the picker shows. The names are in the manifest; the sentence each stands for is in `src/voices.rs`. |
+| `voice_design_description` | text field | A description written by hand. Overrides the dropdown whenever it holds anything; clear it to go back to the list. |
+
+The daemon injects both as `x-tts-option-*` headers on every request, so a
+change takes effect on the next synthesis.
+
+Precedence runs from the most specific to the least: a request that carries its
+own `desc:` wins over both options, the text field wins over the dropdown, and a
+request with none of the three gets a neutral description — a prompt with no
+instruction at all leaves the voice to the sampler, and it would then differ from
+one request to the next.
+
+The other four models ignore both options. A CustomVoice checkpoint conditions on
+one of its nine speakers and a Base one on a clone, so neither has anywhere to
+put a description, and refusing their requests over a setting left behind from a
+model the user has since switched away from would be the wrong answer.
+
+### Cloned voices
+
+The two Base checkpoints have no voices of their own: they speak in a voice
+cloned from a recording. The daemon registers that recording once per load over
+`POST /v1/voices` — mono `s16le` at 24 kHz, trimmed to the fifteen seconds the
+manifest budgets — and later syntheses name the voice by its id alone.
+
+There are two ways to clone, and which one runs depends on whether the stored
+voice has a transcript:
+
+- **without one**, the talker is conditioned on the speaker embedding the
+  reference clip produces;
+- **with one**, the clip is *also* encoded back into codec frames and fed in
+  front of the request as an in-context example, which is what the reference
+  implementation does when it has the words.
+
+`clone_needs_transcript` is therefore left unset: both work, and setting it
+would make the daemon refuse a clip stored without words that this backend can
+serve perfectly well.
+
+A Base checkpoint asked for no voice at all is refused rather than answered.
+Conditioned on nothing it speaks in a voice that changes from one request to the
+next, and there is no default that could stand in for the one the caller meant.
+
+### What is not here
+
+**`speed`.** These models have no rate control. The contract says a backend
+that cannot vary rate ignores the field rather than resampling to fake it, so
+this one ignores it.
+
+### Adding a later generation
+
+Nothing in the code names Qwen3, and what varies between checkpoints is read
+from the files: the frame rate and sample rate from the codec config, the
+speakers and languages from the talker config. Three things still have to line
+up before a new generation can be added to the manifest. `src/qwen3` has to
+implement it, `Kind` in `src/model.rs` has to recognize its
+`tts_model_type`, and the chat template in `src/prompt.rs` has to be the one it
+was trained with — the reference tokenization test is what would catch a
+template that has moved.
+
+## Requirements
+
+A GPU is not required but is strongly recommended. The talker is a transformer
+generating 12.5 frames per second of speech. Measured on an RTX 3090 with a
+warm kernel cache, the 0.6B CustomVoice model loads in 3 seconds, sends its
+first audio 0.3 seconds into a request and synthesizes at about 6x real time —
+19 seconds of speech in 3.2. On a CPU it is slower than real time; the 0.6B
+model is the one to try without a GPU.
+
+Releases ship six builds: a CPU build for x86_64 and aarch64, CUDA 12 and
+CUDA 13, ROCm, and Vulkan. The daemon picks the one matching the machine, and
+ranks a native backend above Vulkan above the CPU. There is no
+compute-capability axis — see the manifest for why.
+
+Weights are downloaded by the daemon before the first load. This process has no
+network at all — it runs with `PrivateNetwork=yes` and a read-only backend
+directory — so it can neither fetch nor write a model file.
+
+### The kernel cache
+
+CubeCL compiles every GPU kernel it meets at runtime. A synthesis needs a few
+hundred of them, about twenty seconds' worth, spread over the first frames and
+the first decode. They are then kept on disk, so only the first run of a build
+pays.
+
+There is one place to keep them: `SUPER_TTS_BACKEND_CACHE_DIR`, which the
+daemon creates and adds to the sandbox's writable paths. Everything else the
+backend can see is read-only, and the writable `/tmp` is `PrivateTmp` and dies
+with the unit. A daemon too old to grant the directory still works — the
+backend logs a warning at startup and recompiles the kernels on every load.
+
+Compilation is not the whole cost. CubeCL also tunes each operation against
+its candidate kernels the first time it sees it, and it keys those entries on
+the *shape* of the problem — which, for the prefix pass that runs once over the
+whole prompt, means the prompt's length. So the load does not stop at mapping
+the weights: it generates two seconds of speech at each of five prompt lengths
+spanning `max_input_chars`, and throws all of it away. That walks the talker,
+the code predictor, the sampler and the codec decoder at the shapes real
+requests use.
+
+`ready` then means ready rather than ready-after-one-more-long-wait, and the
+wait lands while the daemon is still showing its loading indicator, where it
+allows ten minutes.
+
+The ladder is not decoration. With a single warmed length, requests near it
+were fast and everything else stalled on its first use — a 140-character
+request generated at 2.7 frames per second for a whole utterance, ten seconds
+of audio taking forty-seven to produce, on a build whose 300-character
+warm-up had covered 220 and 300 perfectly well.
+
+When the cache turns out to be cold — the ladder is its own probe, taking
+three seconds warm and minutes cold — one more pass generates thirty seconds
+of speech. That is past the point where the talker's key/value cache first
+doubles, which re-captures the graph and tunes wider shapes; twenty-five frames
+never reach it, and the first real request was paying for it instead.
+
+A Base checkpoint has no voice to warm up with, since it only speaks in one that
+was registered. So the warm-up invents one: five seconds of two tones under a
+tremolo, cloned through the real speaker encoder and the real codec encoder, and
+released again when the ladder is done. That covers the encoders and a
+generation conditioned on an embedding rather than on a speaker. What it cannot
+cover is the length of somebody's actual recording — the encoders key on that
+too — so registering a voice can tune once for a clip length not seen before.
+That cost lands in `POST /v1/voices`, which happens once per voice, rather than
+in a synthesis.
+
+What that wait costs, on an RTX 3090:
+
+| Load | Time | What it pays for |
+|---|---|---|
+| Nothing cached | ~4 minutes | Compiling a few hundred kernels and tuning every shape the warm-up walks. Once per GPU. |
+| After a backend upgrade | under a minute | Compiling only: the cache keys kernels by build, but the tuning results survive it. |
+| Same build again | 5.5 seconds | Mapping the weights, and a warm-up that finds everything already there. |
+
+The first row is the one to design around, and it is the reason the cache
+directory exists at all — without it, *every* load is that row, and without the
+warm-up the same four minutes land on whoever sends the first request.
+
+### Shipping a warm cache
+
+The four-minute row above is work that is identical on every machine with the
+same GPU, so it does not have to be done on every machine. CubeCL can export a
+warm cache as a *bundle*, and this backend ships one in `kernels/`, inside the
+release tarball beside the binary.
+
+What it holds is the tuning, not the compiled kernels. On an RTX 3090 that is
+147 MB of PTX against **996 KB** of autotune results — and the small half is
+both the expensive one to produce and the durable one:
+
+| | size | cost to redo | survives a rebuild |
+|---|---:|---|---|
+| Compiled kernels (PTX) | 147 MB | under a minute | no — keyed by the source that generated them |
+| Autotune results | 996 KB | the rest of the four minutes | yes — keyed by operation and shape |
+
+So the bundle is autotune-only. Shipping the PTX as well would multiply the
+tarball by 160 to save the minute, and it would have to be rebuilt and
+re-uploaded for every release.
+
+**One file for every GPU, and for every model.** Nothing in the cache is keyed
+by model — the namespaces are keyed by CubeCL version, device and kernel family
+— so the five checkpoints share whatever shapes they share, and they share most
+of them. Warming all five into one cache costs almost nothing over warming the
+first:
+
+| warmed, in order | its ladder | cache after |
+|---|---:|---:|
+| `0.6b-base` | 78.4s | 37 MB |
+| `0.6b-custom-voice` | 10.1s | 40 MB |
+| `1.7b-base` | 33.5s | 51 MB |
+| `1.7b-custom-voice` | 6.6s | 55 MB |
+| `1.7b-voice-design` | 5.2s | 55 MB |
+
+Each model after the first costs a fraction of it, and the last adds nothing at
+all: only the jump from 0.6B to 1.7B brings genuinely new shapes. All five
+together are 288 entries and 996 KB, against 261 and 900 KB for `0.6b-base`
+alone — so covering the whole backend costs about 96 KB more than covering one
+model of it. Entries for a device this machine is not
+simply never get looked up, which is what makes merging every architecture into
+one file free for the machines that do not match. It is imported once at
+startup, before any device exists:
+
+```
+imported 288 kernel-cache entries from kernels/autotune.bundle in 6.9ms
+  (9 namespaces, 0 already present, 0 refused)
+```
+
+Nothing about it can make a load fail. A missing file, a corrupt one, or one
+warmed on a GPU nobody here has all end in the same place — a warning and the
+cold load that happened before bundles existed.
+
+**Adding an architecture.** Run the exporter on the hardware it is for. With
+`--warm` it loads the model first, filling the cache by running the same ladder
+above; point `SUPER_TTS_BACKEND_CACHE_DIR` at an empty directory so what comes
+out is that cold load and nothing else:
+
+```sh
+SUPER_TTS_BACKEND_DIR=~/.local/share/super-tts/backends/app.super-tts.qwen-tts \
+SUPER_TTS_BACKEND_CACHE_DIR=$(mktemp -d) \
+CUDA_CACHE_PATH=~/.cache/qwen-tts-export/nv \
+  ./super-tts-backend-qwen-tts export-kernels \
+      --warm qwen3-tts-0.6b-base \
+      kernels/autotune.bundle \
+      "RTX 3090 Linux"
+```
+
+The two cache paths want opposite lifetimes, which is easy to get backwards.
+`SUPER_TTS_BACKEND_CACHE_DIR` must be **empty every time**: it is what the
+bundle is cut from, and a directory carrying another model's entries ships them
+too. `CUDA_CACHE_PATH` should be **the same path every time**: it holds the
+driver's PTX-to-SASS translations, which no bundle carries and which cost about
+110 MB of work per cold load, so reusing it makes repeated exports much faster.
+
+Set it to something, though. Running outside the daemon means running outside
+the sandbox, and the NVIDIA driver defaults to `$HOME/.nv/ComputeCache` — so an
+export with this unset writes into the cache every other CUDA program on the
+machine shares, and quietly makes later measurements on this backend look
+better than a new user's would. Under the daemon the question does not arise:
+the sandbox sets `CUDA_CACHE_PATH` inside the one writable directory it grants.
+
+Without `--warm` it exports the cache as it stands, which is for a machine that
+has been running the backend already and wants to package what it learned.
+`--everything` includes the compiled kernels, which is for measuring what that
+147 MB would buy rather than for shipping.
+
+To *add* to the file rather than replace it, import the existing bundle into the
+empty cache first — the exporter writes whatever the cache holds, and importing
+is insert-only, so warming on a second GPU and exporting again yields a file
+covering both.
+
+The exporting binary must be the same build as the consuming one: the CubeCL
+version is part of every namespace, which is why the exporter lives in this
+binary rather than a tool beside it.
+
+### Building
+
+```sh
+git clone https://github.com/jorge-menjivar/super-tts-qwen-tts
+just build-release          # the pure-Rust CPU backend
+just build-cuda             # needs the CUDA headers — no GPU, no compute capability
+just build-rocm             # needs the ROCm headers
+just build-vulkan           # needs nothing; the loader is found at runtime
+```
+
+There is no submodule and no C toolchain to install. The first build is slow
+because Burn is a git dependency and has to be fetched and compiled.
+
+Each build carries exactly one accelerator, which is why the recipes pass
+`--no-default-features`. Cargo features are additive, so `--features cuda` on
+its own would keep the default `flex` backend too and link both.
+
+`just test` runs the suite. One test tokenizes the chat template and compares
+against ids produced by the reference `onig` tokenizer; it skips unless
+`tokenizer.json` is present, so `just test-tokenizer` fetches it once and runs
+everything. `just ci` is the full local gate.
+
+**Burn comes from a fork.** `Cargo.toml` pins `jorge-menjivar/burn` at
+`e7897a65`, which is upstream Burn plus six fixes to `burn-cubecl-fusion` the
+model needs — a fused reduce that resolved its output reference against its
+inputs and crashed, and five more. The revision is not interchangeable with an
+upstream one until those land.
+
+**The model itself is vendored**, in `src/qwen3`, from that fork's `qwen3-tts`
+example. It is a copy rather than a dependency because the example is a demo
+crate: it also pulls `clap`, `hf-hub` and `tokenizers/onig`, and cargo unifies
+features across the graph, so depending on it would put a C regex library and
+an HTTP stack inside a backend that is cross-compiled and runs with no network.
+The module's header records the revision it came from; re-syncing is a diff.
+
+## Installing it
+
+Tag a release and the workflow publishes the tarballs and `backend.toml`; the
+daemon installs it from the registry like any other backend. For a local build:
+
+```sh
+just stage
+```
+
+which puts the binary in the repo root under the name `backend.toml` declares,
+making the directory installable with the daemon's import-from-directory path.
+
+## Layout
+
+| Path | What it holds |
+|---|---|
+| `src/main.rs` | Socket setup; the two environment variables that are the whole interface. |
+| `src/server.rs` | The `/v1` routes, and the error codes the contract names. |
+| `src/model.rs` | Loading, generation, and the chunked decode that makes streaming seamless. |
+| `src/model_thread.rs` | The thread the model lives on, because Burn's generation state is not `Send`. |
+| `src/qwen3/` | The model itself, vendored from Burn's `qwen3-tts` example. |
+| `src/prompt.rs` | The chat template, and its cross-check against the reference tokenizer. |
+| `src/voices.rs` | The three voice id shapes, which ones a checkpoint can resolve, and the twelve designed voices. |
+| `src/lang.rs` | BCP-47 codes to the language names the talker conditions on. |
+| `src/frames.rs` | The response framing, encoded independently of the daemon's decoder. |
+| `backend.toml` | The manifest: models, voices, options, files and their hashes, release assets. |
+| `clippy.toml` | The Qwen checkpoint-family names, so `doc_markdown` stops reading them as items. |
+
+## License
+
+GPL-3.0-only. See `LICENSE`, and `NOTICE` for the third-party work this derives
+from and the Apache-2.0 weights the daemon fetches at runtime.

@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Standalone Qwen TTS subprocess backend, serving whichever generation of
+# Qwen's text-to-speech models the manifest declares — today the Qwen3-TTS
+# checkpoints. Depends only on third-party crates — no super-tts code. Excluded
+# from any parent workspace (own Cargo.lock).
+
+[package]
+    name = "super-tts-backend-qwen-tts"
+    version = "0.1.0"
+    edition = "2024"
+    description = "Qwen text-to-speech backend for Super TTS."
+    repository = "https://github.com/jorge-menjivar/super-tts-qwen-tts"
+    license = "GPL-3.0-only"
+    publish = false
+
+# Own workspace root — never absorbed into a parent workspace.
+[workspace]
+
+
+[[bin]]
+    name = "super-tts-backend-qwen-tts"
+    path = "src/main.rs"
+
+[dependencies]
+    anyhow = "1"
+    axum = { version = "0.8", default-features = false, features = ["json", "tokio"] }
+    # `POST /v1/voices` carries its reference clip as base64 inside the JSON
+    # body, which is the only place this backend meets the encoding.
+    base64 = "0.22"
+    bytes = "1"
+    # The model in `src/qwen3` is Burn's, vendored from this fork's `qwen3-tts`
+    # example (see that module's provenance note). Burn is pinned by revision:
+    # the model needs six fixes to Burn's fusion crates that are not upstream
+    # yet, and `burn` has no stability guarantee between revisions anyway.
+    #
+    # Burn is what buys this backend ROCm and Vulkan, which candle cannot
+    # reach at all — CubeCL compiles every kernel at runtime for whatever
+    # device it finds, which is also why one build per target covers every GPU
+    # generation instead of one per CUDA compute capability.
+    burn = {
+        git = "https://github.com/jorge-menjivar/burn.git",
+        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        features = ["default", "cubecl", "extension"]
+    }
+    burn-cubecl = {
+        git = "https://github.com/jorge-menjivar/burn.git",
+        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        features = ["default"]
+    }
+    burn-fusion = {
+        git = "https://github.com/jorge-menjivar/burn.git",
+        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        features = ["default"]
+    }
+    burn-ir = {
+        git = "https://github.com/jorge-menjivar/burn.git",
+        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e"
+    }
+    burn-store = {
+        git = "https://github.com/jorge-menjivar/burn.git",
+        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        features = ["std", "safetensors"]
+    }
+    # Same revision Burn pins, so one CubeCL is built rather than two.
+    cubecl = {
+        git = "https://github.com/tracel-ai/cubecl",
+        rev = "1c80a9d0b1c726465bd50c85d9cdcaa201f71f11",
+        default-features = false
+    }
+    env_logger = "0.11"
+    hyper = { version = "1", features = ["http1", "server"] }
+    hyper-util = { version = "0.1", features = ["server", "service", "tokio"] }
+    log = "0.4"
+    serde = { version = "1", features = ["derive"] }
+    serde_json = "1"
+    # Reads the `tokenizer.json` the manifest fetches. `fancy-regex` rather
+    # than the `onig` default: Qwen's pre-tokenizer pattern needs a lookahead,
+    # which the plain `regex` crate omits, and `fancy-regex` supplies it in Rust
+    # where `onig` would pull in a C library. `tests/tokenizer.rs` asserts the
+    # two agree on the chat template this backend builds.
+    tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+    tokio = {
+        version = "1",
+        features = ["macros", "net", "rt-multi-thread", "signal", "sync"]
+    }
+    tokio-stream = "0.1"
+
+[dev-dependencies]
+    http-body-util = "0.1"
+    tempfile = "3"
+    # `tokio::time::sleep` in the load-failure test.
+    tokio = { version = "1", features = ["time"] }
+    # `ServiceExt::oneshot` for in-process router tests.
+    tower = { version = "0.5", features = ["util"] }
+
+# One accelerator per build, as the asset it ships in declares. `flex` is the
+# default because it is the one that runs anywhere: a pure-Rust CPU backend
+# with nothing to detect and no driver to find.
+[features]
+    default = ["flex"]
+    cpu = ["burn/cpu"]
+    cuda = ["burn/cuda"]
+    flex = ["burn/flex"]
+    metal = ["burn/metal"]
+    rocm = ["burn/rocm"]
+    vulkan = ["burn/vulkan"]
+    wgpu = ["burn/wgpu"]
+
+[lints.clippy]
+    pedantic = "warn"
+
+
+# The CubeCL the fork's `qwen3-tts` branch builds against: the pinned upstream
+# revision plus its `compilation-cache-default` branch. A `[patch]` in Burn's
+# own manifest does not reach a build that merely depends on Burn — patches
+# come from the root of the crate being built — so this backend has to repeat
+# it, or it would build a different CubeCL than the branch was measured on.
+# Three commits ride on it: compiled kernels kept across runs by default, the
+# sliced memory pool coalescing its free slices lazily rather than on every
+# free, and the channel server taking a partial batch when its producer pauses
+# — which is every frame of a stream.
+[patch."https://github.com/tracel-ai/cubecl"]
+    cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
+    cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
+    cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
+    cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
+    cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
