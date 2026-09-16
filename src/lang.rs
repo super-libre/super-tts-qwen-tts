@@ -2,12 +2,13 @@
 //! Language codes, from what the daemon sends to what the model was trained on.
 //!
 //! The daemon resolves a request to a BCP-47 tag before it reaches a backend
-//! (`en`, `zh-CN`, …) and guarantees it is one of the model's declared
-//! `supported_languages`. Qwen3-TTS instead names its languages in English —
-//! `english`, `chinese` — and the talker turns that name into one of the
-//! `codec_language_id` entries of its config. This module is the join between
-//! the two, and it is the reason `backend.toml` can declare ordinary language
-//! codes rather than leaking the model's vocabulary into the settings UI.
+//! (`en`, `zh-CN`, …), narrowed to the model's declared `supported_languages`
+//! — with one value that is neither, [`AUTO`]. Qwen3-TTS instead names its
+//! languages in English — `english`, `chinese` — and the talker turns that name
+//! into one of the `codec_language_id` entries of its config. This module is
+//! the join between the two, and it is the reason `backend.toml` can declare
+//! ordinary language codes rather than leaking the model's vocabulary into the
+//! settings UI.
 //!
 //! Regional subtags are dropped: the model has one Chinese, not a mainland and
 //! a Taiwanese one, so `zh-CN` and `zh-TW` both resolve to `chinese`. Its two
@@ -37,11 +38,25 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("zh", "chinese"),
 ];
 
-/// The language the model uses when a request names none.
+/// The language the model uses when nothing else names one.
 ///
 /// `auto` is the model's own detection, driven by the script and words of the
-/// text. The daemon never sends `auto` — it owns detection, because it owns the
-/// text — so this is only reached when a request omits `language` entirely.
+/// text, and it is what the talker gets whenever no language id is prefilled.
+///
+/// Two requests arrive here, and both are ordinary. One omits `language`
+/// entirely: the daemon sends the field only when a per-model override or the
+/// global synthesis language resolves against this model, and omits it
+/// otherwise — which is every request from a user who has set neither. The
+/// other names the tag `auto` outright, which the desktop app's language picker
+/// offers as a pinned *Auto-detect* row; the daemon passes that value through
+/// ahead of its `supported_languages` match, so it reaches a backend without
+/// being a language the manifest declares. [`to_model_name`] answers for it
+/// before consulting the table for the same reason.
+///
+/// What the daemon does *not* do is detect: it carries no language detector,
+/// and resolution is over settings, not over the text. So the difference
+/// between these two requests is only where the word came from — the model does
+/// the detecting either way.
 pub const AUTO: &str = "auto";
 
 /// Translate a BCP-47 tag to the language name Qwen3-TTS expects.

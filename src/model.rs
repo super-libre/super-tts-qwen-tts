@@ -157,25 +157,55 @@ const DEEP_WARM_UP_THRESHOLD: std::time::Duration = std::time::Duration::from_se
 /// below more often.
 const STREAM_CHUNK_FRAMES: usize = 25;
 
-/// Frames of context each streamed chunk is decoded with and then discarded.
+/// The `[[options]]` entry a request's sampling temperature arrives under.
 ///
-/// The decoder is convolutional, so a chunk decoded alone does not match the
-/// same frames decoded as part of the whole: the seam is audible. Decoding each
-/// chunk with the frames before it and dropping their audio makes the streamed
-/// result identical to a single decode. Below about 50 the seams return, above
-/// it there is nothing left to gain.
-const STREAM_CONTEXT_FRAMES: usize = 50;
+/// The name is half a contract: `server.rs` reads the header the daemon spells
+/// it as, and the tests either side are what hold the two together.
+pub const TEMPERATURE_OPTION: &str = "temperature";
 
-/// The one shape every chunk reaches the decoder as: a full context plus a full
-/// chunk.
+/// The range [`TEMPERATURE_OPTION`] accepts, inclusive.
 ///
-/// A GPU backend compiles and tunes its kernels per shape, so a decoder fed the
-/// lengths a stream naturally produces — 25 frames, then 50, then 75, then
-/// whatever is left over at the end — pays that cost four times an utterance on
-/// a cold cache. Padding every chunk up to one window pays it once. The decoder
-/// is causal and [`SpeechTokenizer::decode_window`] truncates the padding's
-/// samples, so the audio is unchanged.
-const DECODE_WINDOW_FRAMES: usize = STREAM_CONTEXT_FRAMES + STREAM_CHUNK_FRAMES;
+/// The manifest declares this as the `min` and `max` of a `float` option, with
+/// a `step`, which is what makes it a slider the daemon bounds — so a mistyped
+/// `0.09` never reaches a request as though the backend had agreed to it. It
+/// is repeated here because a header is a wire boundary and the settings sheet
+/// is not the only thing that could set one; the test below is what holds the
+/// two spellings together.
+///
+/// The ends are where they are for a reason: under about 0.6 the talker starts
+/// repeating a frame until it hits the generation cap, and over about 1.2 it
+/// wanders off the text.
+///
+/// The manifest also declares 0.9 as the option's `default`, because a slider
+/// always rests somewhere and that position has to mean something: an option
+/// with no default would show the user 0.6 while the model spoke at 0.9. It
+/// restates what [`GenerationConfig`] ships, which is a second place for one
+/// number to live — the test below is what keeps them the same number.
+pub const TEMPERATURE_RANGE: (f32, f32) = (0.6, 1.2);
+
+/// The temperature an option value asks for, or `None` to leave the
+/// checkpoint's own.
+///
+/// The daemon holds the slider and refuses to store anything outside
+/// [`TEMPERATURE_RANGE`], so in practice this sees a number in that range or
+/// nothing at all. It checks anyway: a header is a wire boundary, a temperature
+/// of zero is a division by zero in the sampler, and a large one is a request
+/// that never terminates.
+#[must_use]
+pub fn temperature_option(value: Option<&str>) -> Option<f32> {
+    let value = value.map(str::trim).filter(|v| !v.is_empty())?;
+    let (low, high) = TEMPERATURE_RANGE;
+    match value.parse::<f32>() {
+        Ok(t) if (low..=high).contains(&t) => Some(t),
+        _ => {
+            log::warn!(
+                "ignoring the {TEMPERATURE_OPTION} option {value:?}: it is not a number in \
+                 {low}..={high}"
+            );
+            None
+        }
+    }
+}
 
 /// How many seconds of speech `frames` is, at `per_second` frames per second.
 ///
@@ -240,6 +270,10 @@ pub struct Prepared {
     language: String,
     voice: Conditioning,
     text_chars: u32,
+    /// The sampling temperature this request asked for, or `None` to keep the
+    /// checkpoint's. Resolved with the rest of the request rather than read on
+    /// the model thread, where the headers it came from are already gone.
+    temperature: Option<f32>,
 }
 
 impl Prepared {
@@ -316,7 +350,18 @@ pub struct QwenTts {
     /// Cloned voices the daemon has registered against this load, keyed by the
     /// uuid of their wire id. Empty for every checkpoint but a Base one, and
     /// deliberately not persisted: the daemon re-registers after every load.
+    /// What *is* persisted is the expensive half of each registration — see
+    /// [`crate::voice_cache`] — so re-registering is a file read.
     voices: HashMap<String, RegisteredVoice>,
+    /// The checkpoint's name, which every derived voice artifact is keyed on:
+    /// the embedding comes from this checkpoint's speaker encoder and means
+    /// nothing to another.
+    model_name: String,
+    /// Where to rebuild a cached embedding, and in which dtype. Held rather
+    /// than recomputed so the rule that picked them at load cannot drift from
+    /// the one that reads them back.
+    device: Device,
+    dtype: DType,
 }
 
 // The model has no `Debug` worth printing and `Tokenizer` has none at all, so
@@ -338,6 +383,9 @@ impl std::fmt::Debug for QwenTts {
             // The voices themselves are tensors with nothing printable in them;
             // which ids are held is the part worth seeing.
             .field("voices", &self.voices.keys())
+            .field("model_name", &self.model_name)
+            .field("device", &self.device)
+            .field("dtype", &self.dtype)
             .finish()
     }
 }
@@ -718,6 +766,9 @@ impl QwenTts {
             sample_rate,
             frames_per_second,
             voices: HashMap::new(),
+            model_name: model_name.to_string(),
+            device,
+            dtype,
         };
         model.warm_up();
         Ok(model)
@@ -742,10 +793,15 @@ impl QwenTts {
     /// stream that already claimed success.
     ///
     /// `configured_voice` is the description the backend's own `[[options]]`
-    /// ask for, already resolved by [`voices::configured`]. It fills in for a
-    /// request that named no voice and is ignored by a request that named one:
-    /// a setting is what the user wants by default, and the `voice` field is
-    /// what they asked for this time.
+    /// ask for, already resolved by [`voices::configured`]. It is the wording
+    /// behind one voice id — [`voices::CUSTOM_VOICE_ID`] — and reaches nothing
+    /// else: a request naming another design gets that design, and one naming
+    /// no voice at all gets the default. It used to fill in for any request
+    /// that named none, which was right while the option was the only way to
+    /// choose and became a lie the moment the designs were voices: the daemon
+    /// sends no voice when the user has stored no preference, so a typed
+    /// description would have overridden the "· default" the picker was
+    /// showing them.
     ///
     /// # Errors
     /// Returns [`RequestError`] when the voice or language is not one this
@@ -757,6 +813,7 @@ impl QwenTts {
         configured_voice: Option<&str>,
         language: Option<&str>,
         instructions: Option<&str>,
+        temperature: Option<f32>,
     ) -> Result<Prepared, RequestError> {
         // Not an error: the options are the backend's, not the model's, and a
         // user who configured a voice and then loaded a checkpoint that builds
@@ -802,6 +859,7 @@ impl QwenTts {
             language,
             voice: conditioning,
             text_chars: u32::try_from(text.chars().count()).unwrap_or(u32::MAX),
+            temperature,
         })
     }
 
@@ -829,73 +887,21 @@ impl QwenTts {
     /// `configured` is the backend's configured description, which only a
     /// VoiceDesign checkpoint has anywhere to put — the other two families
     /// condition on a speaker or a clone, and handing either a description
-    /// would refuse every request from a user who set the option once.
+    /// would refuse every request from a user who set the option once. Within
+    /// that checkpoint it reaches exactly one id, [`voices::CUSTOM_VOICE_ID`].
     fn resolve_voice(
         &self,
         voice: Requested<'_>,
         configured: Option<&str>,
     ) -> Result<Conditioning, RequestError> {
-        match (self.kind, voice) {
-            (Kind::CustomVoice, Requested::Speaker(s)) => {
-                if self.speakers.iter().any(|k| k == s) {
-                    Ok(Conditioning::Speaker(s.to_string()))
-                } else {
-                    Err(RequestError::UnknownVoice(format!(
-                        "unknown voice {s}; this model has {}",
-                        self.speakers.join(", ")
-                    )))
-                }
-            }
-            (Kind::CustomVoice, Requested::Default) => Ok(self
-                .default_speaker
-                .clone()
-                .map_or(Conditioning::None, Conditioning::Speaker)),
-            (Kind::CustomVoice, Requested::Description(_)) => Err(RequestError::UnknownVoice(
-                "this model speaks with one of its own voices, not a described one".to_string(),
-            )),
-            (Kind::VoiceDesign, Requested::Description(d)) => {
-                Ok(Conditioning::Description(d.to_string()))
-            }
-            (Kind::VoiceDesign, Requested::Default) => Ok(Conditioning::Description(
-                configured
-                    .unwrap_or(voices::DEFAULT_DESCRIPTION)
-                    .to_string(),
-            )),
-            (Kind::VoiceDesign, Requested::Speaker(s)) => Err(RequestError::UnknownVoice(format!(
-                "unknown voice {s}; this model builds a voice from a description, \
-                 so its voice ids look like desc:<description>"
-            ))),
-            // Registration is a separate request, and the daemon makes it
-            // before the first synthesis naming the voice. An id that is not
-            // here is one whose registration failed or never happened, which is
-            // worth saying plainly rather than synthesizing in some other voice.
-            (Kind::Base, Requested::Cloned(uuid)) => {
-                if self.voices.contains_key(uuid) {
-                    Ok(Conditioning::Cloned(uuid.to_string()))
-                } else {
-                    Err(RequestError::UnknownVoice(format!(
-                        "the voice {uuid} was never registered with this load"
-                    )))
-                }
-            }
-            // A Base checkpoint conditioned on nothing speaks in a voice that
-            // changes from one request to the next, so there is no sensible
-            // default to fall back to.
-            (Kind::Base, Requested::Default) => Err(RequestError::UnknownVoice(
-                "this model speaks in a cloned voice, so a request has to name one".to_string(),
-            )),
-            (Kind::Base, Requested::Speaker(s) | Requested::Description(s)) => {
-                Err(RequestError::UnknownVoice(format!(
-                    "unknown voice {s}; this model clones a voice from a recording, \
-                     so its voice ids look like voice:<uuid>"
-                )))
-            }
-            (Kind::CustomVoice | Kind::VoiceDesign, Requested::Cloned(_)) => {
-                Err(RequestError::UnknownVoice(
-                    "this model cannot clone a voice from reference audio".to_string(),
-                ))
-            }
-        }
+        conditioning_for(
+            self.kind,
+            &self.speakers,
+            self.default_speaker.as_deref(),
+            &|uuid| self.voices.contains_key(uuid),
+            voice,
+            configured,
+        )
     }
 
     /// Whether this checkpoint clones a voice from a recording.
@@ -941,11 +947,50 @@ impl QwenTts {
         if samples.is_empty() {
             bail!("the reference recording is empty");
         }
+        let transcript = transcript.map(str::trim).filter(|t| !t.is_empty());
+        let seconds = seconds_of(samples.len(), f64::from(self.reference_sample_rate()));
+
+        // The cached half first. Deriving is expensive in a way that has
+        // nothing to do with the size of what comes out: the codec encoder
+        // meets the whole clip as one tensor, so every clip length is a shape
+        // CubeCL has to autotune, and tuning is the slow part of meeting a new
+        // shape. What it produces is a few tens of kilobytes.
+        let cache = crate::voice_cache::dir().map(|dir| {
+            (
+                dir,
+                crate::voice_cache::key(&self.model_name, transcript, samples),
+            )
+        });
+        if let Some((dir, key)) = cache.as_ref()
+            && let Some(derived) = crate::voice_cache::load(dir, key)
+        {
+            let dims = [derived.embedding.len()];
+            // f32 on disk whatever the talker runs in. A bf16 value is exactly
+            // representable in f32, so widening to write and narrowing to read
+            // gives back the bits that were there.
+            let embedding = Tensor::<1>::from_data(
+                burn::tensor::TensorData::new(derived.embedding, dims),
+                &self.device,
+            )
+            .cast(self.dtype);
+            log::info!("registered the voice {uuid} from {seconds:.1}s of audio, already encoded");
+            self.voices.insert(
+                uuid.to_string(),
+                RegisteredVoice {
+                    embedding,
+                    icl: derived.icl,
+                },
+            );
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
         let embedding = self
             .talker
             .speaker_embedding(samples)
             .map_err(|e| anyhow!("deriving the speaker embedding: {e}"))?;
-        let icl = match transcript.map(str::trim).filter(|t| !t.is_empty()) {
+        let embedded = started.elapsed();
+        let icl = match transcript {
             Some(transcript) => {
                 let ref_codes = self
                     .speech_tokenizer
@@ -960,15 +1005,42 @@ impl QwenTts {
             }
             None => None,
         };
+        // Both halves timed separately: the first registration of a clip length
+        // can run for the better part of a minute, and which half it was spent
+        // in is the difference between tuning the speaker encoder and tuning
+        // the codec.
         log::info!(
-            "registered the voice {uuid} from {:.1}s of audio{}",
-            seconds_of(samples.len(), f64::from(self.reference_sample_rate())),
+            "registered the voice {uuid} from {seconds:.1}s of audio{} in {:.1?} \
+             (embedding {embedded:.1?})",
             if icl.is_some() {
                 ", with its transcript"
             } else {
                 ""
-            }
+            },
+            started.elapsed(),
         );
+
+        if let Some((dir, key)) = cache.as_ref() {
+            // Cloned to write: the tensor goes on to serve the voice, and the
+            // widening cast is what makes the stored copy dtype-independent.
+            let values = embedding
+                .clone()
+                .cast(DType::F32)
+                .into_data()
+                .try_to_vec::<f32>();
+            match values {
+                Ok(embedding) => crate::voice_cache::store(
+                    dir,
+                    key,
+                    &crate::voice_cache::Derived {
+                        embedding,
+                        icl: icl.clone(),
+                    },
+                ),
+                Err(e) => log::warn!("not caching the voice {uuid}: reading the embedding: {e:?}"),
+            }
+        }
+
         self.voices
             .insert(uuid.to_string(), RegisteredVoice { embedding, icl });
         Ok(())
@@ -1066,7 +1138,7 @@ impl QwenTts {
         let start = std::time::Instant::now();
         for length in WARM_UP_LENGTHS {
             let text: String = WARM_UP_TEXT.chars().take(length).collect();
-            let prepared = match self.prepare(&text, voice, None, Some("en"), None) {
+            let prepared = match self.prepare(&text, voice, None, Some("en"), None, None) {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("skipping the warm-up: {e}");
@@ -1106,7 +1178,7 @@ impl QwenTts {
         // hundred frames — nowhere near a doubling.
         let longest = WARM_UP_LENGTHS[WARM_UP_LENGTHS.len() - 1];
         let text: String = WARM_UP_TEXT.chars().take(longest).collect();
-        let Ok(prepared) = self.prepare(&text, voice, None, Some("en"), None) else {
+        let Ok(prepared) = self.prepare(&text, voice, None, Some("en"), None, None) else {
             return;
         };
         let mut frames = 0_usize;
@@ -1135,10 +1207,18 @@ impl QwenTts {
         mut should_continue: impl FnMut() -> bool,
         mut on_audio: impl FnMut(&[f32]) -> bool,
     ) -> Result<Outcome> {
-        let generation = GenerationConfig {
+        let mut generation = GenerationConfig {
             max_new_tokens,
             ..Default::default()
         };
+        // Only the talker's own sampling. The code predictor draws the codec's
+        // residual detail rather than the shape of the utterance, and the
+        // reference implementation gives it its own `subtalker_temperature`;
+        // moving both from one field would be a second, unasked-for change to
+        // how the audio sounds.
+        if let Some(temperature) = prepared.temperature {
+            generation.sampling = generation.sampling.with_temperature(temperature);
+        }
 
         let frames_per_second = self.frames_per_second;
         // Split borrows: generation holds `&mut self.talker` while the decoder
@@ -1221,9 +1301,14 @@ impl QwenTts {
 ///
 /// Each chunk is decoded together with the frames that precede it, whose audio
 /// is then discarded, so the streamed result is sample-for-sample what a single
-/// decode of the whole utterance would have produced. Every such decode goes
-/// through one window of [`DECODE_WINDOW_FRAMES`], short chunks padded up to
-/// it, so the decoder is compiled and tuned for a single shape.
+/// decode of the whole utterance would have produced. How many of them that
+/// takes is the decoder's to say — see
+/// [`SpeechTokenizer::decode_context_frames`] — and not a number to pick by
+/// ear: a context short of it silently truncates the attention of every chunk
+/// past the first, which is the far end of an utterance and nowhere else.
+/// Every such decode goes through one window of [`Self::window_frames`], short
+/// chunks padded up to it, so the decoder is compiled and tuned for a single
+/// shape.
 struct ChunkDecoder<'a> {
     speech_tokenizer: &'a mut SpeechTokenizer,
     /// Every frame generated so far, flattened.
@@ -1232,15 +1317,39 @@ struct ChunkDecoder<'a> {
     num_code_groups: usize,
     /// Frames whose audio has already been handed to the caller.
     written: usize,
+    /// Frames of context each decode carries, read off the decoder;
+    /// `usize::MAX` when it attends over the whole sequence, where the `min`
+    /// in [`decode_span`] turns it into every frame generated so far.
+    context_frames: usize,
+    /// The one shape every decode reaches the decoder as: a full context plus a
+    /// full chunk. `None` when the context is unbounded and there is no one
+    /// shape to hold.
+    ///
+    /// A GPU backend compiles and tunes its kernels per shape, so a decoder fed
+    /// the lengths a stream naturally produces — a chunk, then two, then three,
+    /// then whatever is left over at the end — pays that cost several times an
+    /// utterance on a cold cache. Padding every chunk up to one window pays it
+    /// once. The decoder is causal and
+    /// [`SpeechTokenizer::decode_window`] truncates the padding's samples, so
+    /// the audio is unchanged.
+    window_frames: Option<usize>,
 }
 
 impl<'a> ChunkDecoder<'a> {
     fn new(speech_tokenizer: &'a mut SpeechTokenizer) -> Self {
+        let context_frames = speech_tokenizer
+            .decode_context_frames()
+            .unwrap_or(usize::MAX);
         Self {
             speech_tokenizer,
             codes: Vec::new(),
             num_code_groups: 0,
             written: 0,
+            context_frames,
+            // Only overflows for the unbounded context, which is what `None`
+            // is for: a decode that reaches back to the first frame has a
+            // different length every time and no window to be padded to.
+            window_frames: context_frames.checked_add(STREAM_CHUNK_FRAMES),
         }
     }
 
@@ -1271,35 +1380,144 @@ impl<'a> ChunkDecoder<'a> {
         if frames <= self.written {
             return None;
         }
-        let (context, span) = decode_span(self.written, frames);
-        debug_assert!(span <= DECODE_WINDOW_FRAMES);
+        let (context, span) = decode_span(self.written, frames, self.context_frames);
         let start = (self.written - context) * self.num_code_groups;
+        let codes = &self.codes[start..frames * self.num_code_groups];
+        let samples_per_frame = self.speech_tokenizer.samples_per_frame();
         // `decode_window` drops the context's audio itself: it was decoded only
         // so the seam between this chunk and the last one matches a single
-        // decode.
-        let pcm = self.speech_tokenizer.decode_window(
-            &self.codes[start..frames * self.num_code_groups],
-            context,
-            DECODE_WINDOW_FRAMES,
-        );
+        // decode. Without a window there is nothing to pad to, so the decode is
+        // the prefix at its own length and the context is dropped here.
+        let pcm = if let Some(window) = self.window_frames {
+            debug_assert!(span <= window);
+            self.speech_tokenizer.decode_window(codes, context, window)
+        } else {
+            let mut pcm = self.speech_tokenizer.decode_chunk(codes);
+            pcm.drain(..context * samples_per_frame);
+            pcm
+        };
         self.written = frames;
         Some(pcm)
     }
 }
 
-/// The frames one decode covers, given how many have been written and how many
-/// exist: its context, and the total it sees — context included.
+/// The frames one decode covers, given how many have been written, how many
+/// exist and how many of context the decoder asks for: its context, and the
+/// total it sees — context included.
 ///
-/// Free of the decoder so the invariant that total never outgrows
-/// [`DECODE_WINDOW_FRAMES`] can be checked without one.
-fn decode_span(written: usize, frames: usize) -> (usize, usize) {
-    let context = usize::min(STREAM_CONTEXT_FRAMES, written);
+/// Free of the decoder so the invariant that the total never outgrows a window
+/// can be checked without one.
+fn decode_span(written: usize, frames: usize, context_frames: usize) -> (usize, usize) {
+    let context = usize::min(context_frames, written);
     (context, context + frames - written)
+}
+
+/// The voice-resolution matrix: every `(checkpoint family, requested voice)`
+/// pair and what the model is conditioned on for it.
+///
+/// Free of [`QwenTts`] so the whole table is testable without a loaded
+/// checkpoint — it is the part of a request most likely to be wrong and the
+/// least likely to be caught by listening, since a mis-resolved voice still
+/// produces confident speech. `registered` answers whether a cloned id was
+/// pushed to this load; taking a predicate rather than the map keeps a test
+/// from having to build a `Tensor` to name a voice.
+fn conditioning_for(
+    kind: Kind,
+    speakers: &[String],
+    default_speaker: Option<&str>,
+    registered: &dyn Fn(&str) -> bool,
+    voice: Requested<'_>,
+    configured: Option<&str>,
+) -> Result<Conditioning, RequestError> {
+    match (kind, voice) {
+        (Kind::CustomVoice, Requested::Speaker(s)) => {
+            if speakers.iter().any(|k| k == s) {
+                Ok(Conditioning::Speaker(s.to_string()))
+            } else {
+                Err(RequestError::UnknownVoice(format!(
+                    "unknown voice {s}; this model has {}",
+                    speakers.join(", ")
+                )))
+            }
+        }
+        (Kind::CustomVoice, Requested::Default) => Ok(default_speaker
+            .map(str::to_string)
+            .map_or(Conditioning::None, Conditioning::Speaker)),
+        (Kind::CustomVoice, Requested::Description(_)) => Err(RequestError::UnknownVoice(
+            "this model speaks with one of its own voices, not a described one".to_string(),
+        )),
+        (Kind::VoiceDesign, Requested::Description(d)) => {
+            Ok(Conditioning::Description(d.to_string()))
+        }
+        // Not the configured description: a request naming no voice is one
+        // whose user stored no preference, and the picker is showing them
+        // the manifest's `default_voice` — which is this. Reading the
+        // option here would speak in a voice the card says is not selected.
+        (Kind::VoiceDesign, Requested::Default) => Ok(Conditioning::Description(
+            voices::DEFAULT_DESCRIPTION.to_string(),
+        )),
+        // The one id whose description is not fixed: it stands for whatever
+        // the backend's description option says, and for the default when
+        // that is empty — so picking Custom and writing nothing is the
+        // voice a user who picked nothing gets, not a prompt with no
+        // instruction in it.
+        (Kind::VoiceDesign, Requested::Speaker(s)) if s == voices::CUSTOM_VOICE_ID => {
+            Ok(Conditioning::Description(
+                configured
+                    .unwrap_or(voices::DEFAULT_DESCRIPTION)
+                    .to_string(),
+            ))
+        }
+        // The twelve pre-made designs, which are ordinary declared voices:
+        // the daemon has already refused anything this model does not list,
+        // so an id that misses here is one the manifest and the table
+        // disagree about — a build-time bug, and the test in `voices` is
+        // what keeps it one.
+        (Kind::VoiceDesign, Requested::Speaker(s)) => voices::design(s)
+            .map(|description| Conditioning::Description(description.to_string()))
+            .ok_or_else(|| {
+                RequestError::UnknownVoice(format!(
+                    "unknown voice {s}; this model builds a voice from a description, \
+                         so its voice ids are the designs it declares or desc:<description>"
+                ))
+            }),
+        // Registration is a separate request, and the daemon makes it
+        // before the first synthesis naming the voice. An id that is not
+        // here is one whose registration failed or never happened, which is
+        // worth saying plainly rather than synthesizing in some other voice.
+        (Kind::Base, Requested::Cloned(uuid)) => {
+            if registered(uuid) {
+                Ok(Conditioning::Cloned(uuid.to_string()))
+            } else {
+                Err(RequestError::UnknownVoice(format!(
+                    "the voice {uuid} was never registered with this load"
+                )))
+            }
+        }
+        // A Base checkpoint conditioned on nothing speaks in a voice that
+        // changes from one request to the next, so there is no sensible
+        // default to fall back to.
+        (Kind::Base, Requested::Default) => Err(RequestError::UnknownVoice(
+            "this model speaks in a cloned voice, so a request has to name one".to_string(),
+        )),
+        (Kind::Base, Requested::Speaker(s) | Requested::Description(s)) => {
+            Err(RequestError::UnknownVoice(format!(
+                "unknown voice {s}; this model clones a voice from a recording, \
+                     so its voice ids look like voice:<uuid>"
+            )))
+        }
+        (Kind::CustomVoice | Kind::VoiceDesign, Requested::Cloned(_)) => {
+            Err(RequestError::UnknownVoice(
+                "this model cannot clone a voice from reference audio".to_string(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen3::sampling::Sampling;
 
     /// The talker cannot outrun the daemon's 32 MiB cap on one response: at
     /// 24 kHz mono s16le, the longest utterance it may generate must stay
@@ -1323,25 +1541,195 @@ mod tests {
     }
 
     /// Every decode is padded up to one window, so no decode may outgrow it —
-    /// `decode_window` asserts, and it would do so mid-utterance. The chunk and
-    /// context sizes are what has to keep fitting, whatever they are changed to.
+    /// `decode_window` asserts, and it would do so mid-utterance. The context a
+    /// decoder asks for is whatever it asks for, so the invariant is checked
+    /// across a range of them rather than for the one a checkpoint happens to
+    /// want.
     #[test]
     fn no_decode_of_a_stream_outgrows_the_window() {
-        for total in 1..=4 * DECODE_WINDOW_FRAMES {
-            let mut written = 0;
-            for generated in 1..=total {
-                if generated - written < STREAM_CHUNK_FRAMES {
-                    continue;
+        for context_frames in [0, 1, STREAM_CHUNK_FRAMES, 73, 200] {
+            let window = context_frames + STREAM_CHUNK_FRAMES;
+            for total in 1..=4 * window {
+                let mut written = 0;
+                for generated in 1..=total {
+                    if generated - written < STREAM_CHUNK_FRAMES {
+                        continue;
+                    }
+                    let (_, span) = decode_span(written, generated, context_frames);
+                    assert!(span <= window, "chunk of {span} frames past {window}");
+                    written = generated;
                 }
-                let (_, span) = decode_span(written, generated);
-                assert!(span <= DECODE_WINDOW_FRAMES, "chunk of {span} frames");
-                written = generated;
-            }
-            if total > written {
-                let (_, span) = decode_span(written, total);
-                assert!(span <= DECODE_WINDOW_FRAMES, "flush of {span} frames");
+                if total > written {
+                    let (_, span) = decode_span(written, total, context_frames);
+                    assert!(span <= window, "flush of {span} frames past {window}");
+                }
             }
         }
+    }
+
+    /// The context a chunked decode carries is the decoder's to state, and the
+    /// bug this replaced was a hand-picked 50 against a decoder that wanted 73:
+    /// every chunk past the first lost the older end of its attention window,
+    /// which is audible from the point the first truncated chunk starts and
+    /// never recovers. A decode that asks for no context at all still has to
+    /// come out well-formed, since that is the first chunk of every utterance.
+    #[test]
+    fn a_decode_carries_the_context_the_decoder_asks_for() {
+        // The first chunk has nothing behind it, whatever the decoder wants.
+        assert_eq!(
+            decode_span(0, STREAM_CHUNK_FRAMES, 73),
+            (0, STREAM_CHUNK_FRAMES)
+        );
+        // Once there is history, all of it is carried until the decoder is
+        // satisfied, and exactly that much afterwards.
+        assert_eq!(decode_span(25, 50, 73), (25, 50));
+        assert_eq!(decode_span(50, 75, 73), (50, 75));
+        assert_eq!(decode_span(75, 100, 73), (73, 98));
+        assert_eq!(decode_span(200, 225, 73), (73, 98));
+    }
+
+    /// The range in this file and the `min`/`max` in the manifest are one
+    /// range written twice: the daemon refuses to store anything outside the
+    /// manifest's, so a value widened here alone would never arrive, and one
+    /// widened there alone would be refused by [`temperature_option`] on the
+    /// way in.
+    #[test]
+    fn the_temperature_range_is_what_the_manifest_declares() {
+        let manifest = include_str!("../backend.toml");
+        let field = |key| {
+            crate::manifest_probe::option_field(manifest, TEMPERATURE_OPTION, key)
+                .unwrap_or_else(|| panic!("the manifest declares `{key}`"))
+                .parse::<f32>()
+                .unwrap_or_else(|_| panic!("`{key}` is a number"))
+        };
+        assert_eq!(
+            (field("min"), field("max")),
+            TEMPERATURE_RANGE,
+            "the manifest's range and this crate's disagree"
+        );
+        // Both ends and a grid is what makes it a slider rather than a field,
+        // and a slider is not also a dropdown.
+        assert!(
+            crate::manifest_probe::option_field(manifest, TEMPERATURE_OPTION, "step").is_some(),
+            "the option declares no step, so it renders as a text field"
+        );
+        assert!(
+            crate::manifest_probe::declared_choices(manifest, TEMPERATURE_OPTION).is_none(),
+            "an option is a dropdown or a slider, not both"
+        );
+    }
+
+    /// The ends have to be in that order, and the step has to divide something:
+    /// the range is what [`temperature_option`] accepts, so a reversed one
+    /// would refuse every value.
+    #[test]
+    fn the_temperature_range_climbs() {
+        let (low, high) = TEMPERATURE_RANGE;
+        assert!(low < high, "{TEMPERATURE_RANGE:?} is not a range");
+        let manifest = include_str!("../backend.toml");
+        let step: f32 = crate::manifest_probe::option_field(manifest, TEMPERATURE_OPTION, "step")
+            .expect("the manifest declares a step")
+            .parse()
+            .expect("the step is a number");
+        assert!(step > 0.0 && step <= high - low, "unusable step {step}");
+    }
+
+    /// The setting a request arrives without is the one the checkpoint ships,
+    /// so the range has to reach it — otherwise the slider cannot express
+    /// "leave it alone" and every position on it is a change.
+    #[test]
+    fn the_shipped_temperature_is_inside_the_range() {
+        let shipped = match GenerationConfig::default().sampling {
+            Sampling::TopKThenTopP { temperature, .. } | Sampling::TopP { temperature, .. } => {
+                temperature
+            }
+            Sampling::ArgMax => panic!("the checkpoints sample; they do not take the argmax"),
+        };
+        assert_eq!(temperature_option(Some("0.9")), Some(shipped));
+        let (low, high) = TEMPERATURE_RANGE;
+        assert!((low..=high).contains(&shipped), "{shipped} is out of range");
+        // And the manifest says so too: the slider rests on its `default`, so
+        // that number and the one the checkpoints ship have to be the same or
+        // the settings sheet shows a temperature the model is not using.
+        let manifest = include_str!("../backend.toml");
+        let declared: f32 =
+            crate::manifest_probe::option_field(manifest, TEMPERATURE_OPTION, "default")
+                .expect("a slider declares the value it rests on")
+                .parse()
+                .expect("the default is a number");
+        // Both are meant to be the one number 0.9, so the tolerance is only
+        // here to keep the lint quiet about comparing floats at all: what this
+        // guards is the two drifting apart, not their last bit.
+        assert!(
+            (declared - shipped).abs() < f32::EPSILON,
+            "the manifest's default ({declared}) and the checkpoint's temperature ({shipped}) disagree"
+        );
+    }
+
+    /// An unset option leaves the checkpoint's own temperature in place. It is
+    /// the difference between a setting and a default, and the reason the
+    /// manifest declares no `default` of its own.
+    #[test]
+    fn an_unset_temperature_overrides_nothing() {
+        assert_eq!(temperature_option(None), None);
+        assert_eq!(temperature_option(Some("")), None);
+        assert_eq!(temperature_option(Some("  ")), None);
+    }
+
+    /// Both ends inclusive, and every position the slider can stop on between
+    /// them. As the daemon spells it: an option value crosses the wire as the
+    /// text of an `x-tts-option-*` header, whatever its declared type.
+    #[test]
+    fn every_temperature_in_the_range_is_accepted() {
+        let (low, high) = TEMPERATURE_RANGE;
+        for spelled in [format!("{low:?}"), format!("{high:?}"), "0.85".to_string()] {
+            assert!(
+                temperature_option(Some(&spelled)).is_some(),
+                "the manifest accepts {spelled} and this refuses it"
+            );
+        }
+        assert_eq!(temperature_option(Some("0.6")), Some(low));
+        assert_eq!(temperature_option(Some("1.2")), Some(high));
+    }
+
+    /// Out of range, not merely unusual: zero divides the logits by zero and a
+    /// large one never settles on an end-of-speech token.
+    #[test]
+    fn a_temperature_outside_the_ladder_is_refused() {
+        assert_eq!(temperature_option(Some("0")), None);
+        assert_eq!(temperature_option(Some("-1")), None);
+        assert_eq!(temperature_option(Some("2.5")), None);
+        assert_eq!(temperature_option(Some("NaN")), None);
+        assert_eq!(temperature_option(Some("hot")), None);
+    }
+
+    /// A value between two rungs is still in range, and is taken: the ladder
+    /// bounds what is sensible, it does not enumerate what is representable.
+    #[test]
+    fn a_temperature_between_two_rungs_is_taken() {
+        assert_eq!(temperature_option(Some("0.85")), Some(0.85));
+    }
+
+    /// Only the talker's. The code predictor draws the codec's residual detail
+    /// and the reference implementation gives it its own knob, so one option
+    /// must not quietly move two.
+    #[test]
+    fn a_temperature_moves_the_talker_and_not_the_code_predictor() {
+        let default = GenerationConfig::default();
+        let moved = default.sampling.clone().with_temperature(0.7);
+        assert_eq!(
+            moved,
+            Sampling::TopKThenTopP {
+                k: 50,
+                p: 1.0,
+                temperature: 0.7
+            }
+        );
+        assert_eq!(
+            default.subtalker_sampling,
+            GenerationConfig::default().subtalker_sampling,
+            "the code predictor keeps what the checkpoint gave it"
+        );
     }
 
     #[test]
@@ -1380,5 +1768,141 @@ mod tests {
         // `flex` and `cpu` are two CPU backends and both report "cpu".
         assert_eq!(name, BUILT_FOR);
         assert_eq!(ON_GPU, BUILT_FOR != "cpu");
+    }
+}
+
+#[cfg(test)]
+mod voice_resolution_tests {
+    //! The voice-resolution matrix, which decides what a checkpoint is
+    //! conditioned on. A wrong answer here still produces fluent speech, in
+    //! the wrong voice, so every arm is pinned rather than listened to.
+    use super::{Conditioning, Kind, RequestError, conditioning_for};
+    use crate::voices::{self, Requested};
+
+    fn speakers() -> Vec<String> {
+        vec!["ryan".to_string(), "vivian".to_string()]
+    }
+
+    fn resolve(
+        kind: Kind,
+        voice: Requested<'_>,
+        configured: Option<&str>,
+    ) -> Result<Conditioning, RequestError> {
+        conditioning_for(
+            kind,
+            &speakers(),
+            Some("ryan"),
+            &|uuid| uuid == "known",
+            voice,
+            configured,
+        )
+    }
+
+    fn described(result: Result<Conditioning, RequestError>) -> String {
+        match result {
+            Ok(Conditioning::Description(d)) => d,
+            other => panic!("expected a description, got {other:?}"),
+        }
+    }
+
+    /// The point of the change: Custom is a declared voice id whose wording
+    /// comes from the option, so picking it is what reaches the field.
+    #[test]
+    fn custom_speaks_the_configured_description() {
+        let got = resolve(
+            Kind::VoiceDesign,
+            Requested::Speaker(voices::CUSTOM_VOICE_ID),
+            Some("A hoarse pirate."),
+        );
+        assert_eq!(described(got), "A hoarse pirate.");
+    }
+
+    /// An empty field is not an instruction to describe nothing: Custom has to
+    /// fall back to the same voice `default_voice` names, or clearing the field
+    /// would leave the voice to the sampler.
+    #[test]
+    fn custom_with_an_empty_field_speaks_the_default() {
+        let got = resolve(
+            Kind::VoiceDesign,
+            Requested::Speaker(voices::CUSTOM_VOICE_ID),
+            None,
+        );
+        assert_eq!(described(got), voices::DEFAULT_DESCRIPTION);
+    }
+
+    /// A named design is its own wording, whatever is typed in the field —
+    /// otherwise the option would silently override the picker again.
+    #[test]
+    fn a_named_design_ignores_the_configured_description() {
+        let got = resolve(
+            Kind::VoiceDesign,
+            Requested::Speaker("deep-narrator-male"),
+            Some("A hoarse pirate."),
+        );
+        assert_eq!(
+            described(got),
+            voices::design("deep-narrator-male").unwrap()
+        );
+    }
+
+    /// No voice named is no preference stored, and the picker is showing the
+    /// manifest's default — so the field must not speak for it.
+    #[test]
+    fn naming_no_voice_speaks_the_default_not_the_field() {
+        let got = resolve(
+            Kind::VoiceDesign,
+            Requested::Default,
+            Some("A hoarse pirate."),
+        );
+        assert_eq!(described(got), voices::DEFAULT_DESCRIPTION);
+    }
+
+    /// Free text per request still wins over everything, which is what keeps
+    /// `described` in this model's `voice_kinds` meaningful.
+    #[test]
+    fn a_request_description_still_wins() {
+        let got = resolve(
+            Kind::VoiceDesign,
+            Requested::Description("A weary sailor."),
+            Some("A hoarse pirate."),
+        );
+        assert_eq!(described(got), "A weary sailor.");
+    }
+
+    #[test]
+    fn a_design_model_refuses_an_id_it_does_not_declare() {
+        let got = resolve(Kind::VoiceDesign, Requested::Speaker("ryan"), None);
+        assert!(matches!(got, Err(RequestError::UnknownVoice(_))), "{got:?}");
+    }
+
+    /// The other two families are untouched by any of this: a CustomVoice
+    /// checkpoint still conditions on its own speakers and a Base one on a
+    /// clone, and neither reads the field.
+    #[test]
+    fn the_other_families_are_unchanged() {
+        assert!(matches!(
+            resolve(Kind::CustomVoice, Requested::Speaker("vivian"), Some("A hoarse pirate.")),
+            Ok(Conditioning::Speaker(s)) if s == "vivian"
+        ));
+        assert!(matches!(
+            resolve(Kind::CustomVoice, Requested::Default, None),
+            Ok(Conditioning::Speaker(s)) if s == "ryan"
+        ));
+        assert!(matches!(
+            resolve(Kind::CustomVoice, Requested::Speaker("custom"), None),
+            Err(RequestError::UnknownVoice(_))
+        ));
+        assert!(matches!(
+            resolve(Kind::Base, Requested::Cloned("known"), None),
+            Ok(Conditioning::Cloned(id)) if id == "known"
+        ));
+        assert!(matches!(
+            resolve(Kind::Base, Requested::Cloned("absent"), None),
+            Err(RequestError::UnknownVoice(_))
+        ));
+        assert!(matches!(
+            resolve(Kind::Base, Requested::Default, None),
+            Err(RequestError::UnknownVoice(_))
+        ));
     }
 }

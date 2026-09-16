@@ -20,11 +20,14 @@
 
 mod frames;
 mod lang;
+#[cfg(test)]
+mod manifest_probe;
 mod model;
 mod model_thread;
 mod prompt;
 mod qwen3;
 mod server;
+mod voice_cache;
 mod voices;
 
 use std::path::{Path, PathBuf};

@@ -188,12 +188,20 @@ async fn cancel(State(s): State<Arc<AppState>>) -> Json<Value> {
 
 /// Body limit for `POST /v1/voices`.
 ///
-/// A reference clip arrives as base64 PCM, a third larger than the raw audio,
-/// and the manifest's `clone_ref_seconds` budget of 15 seconds at 24 kHz mono
-/// `s16le` is 960 KB once encoded. Two mebibytes leaves room for the transcript
-/// and for a longer budget later — a body limit that is merely tight fails as a
-/// bare `413` with nothing in it to read.
-const VOICE_BODY_LIMIT: usize = 2 << 20;
+/// Sized to the largest body the daemon can ever send, not to this manifest's
+/// budget — which is the difference between a constant that survives the next
+/// edit and one that has to be found again. A budget of 15 seconds put 960 KB
+/// through here; raising it to 30 put 1.92 MB through a two-mebibyte limit,
+/// eight percent short of a bare `413` with nothing in it to read.
+///
+/// The envelope: the daemon stores at most `MAX_CLIP_SECONDS` — 120 seconds —
+/// and delivers 24 kHz mono `s16le`, which is 5.76 MB raw and 7.32 MiB once
+/// base64 has added its third, plus a transcript it caps at 4000 characters.
+/// Eight mebibytes holds all of it, so no `clone_ref_seconds` a manifest can
+/// declare will be refused by a byte count. The daemon's own `MAX_UPLOAD_BYTES`
+/// is reasoned the same way: set above the real ceiling, so the check that
+/// reports what is actually wrong is the one that fires.
+const VOICE_BODY_LIMIT: usize = 8 << 20;
 
 /// `POST /v1/voices` body.
 #[derive(Debug, Deserialize)]
@@ -358,18 +366,16 @@ fn decode_reference(audio: &str) -> Result<Vec<f32>, String> {
         .collect())
 }
 
-/// The headers the daemon injects the backend's two `[[options]]` under.
+/// The header the daemon injects this backend's one `[[options]]` entry under.
 ///
-/// `x-tts-option-<name>` is the contract's own spelling, with the names
-/// [`voices::PRESET_OPTION`] and [`voices::DESCRIPTION_OPTION`] declare; the
-/// test below is what keeps these strings and those names the same pair.
-/// Written out rather than joined at runtime because they are read once per
-/// request and a `HeaderMap` lookup wants a `&str` it does not have to own.
-const PRESET_HEADER: &str = "x-tts-option-voice_design_preset";
-/// The free-text half of the pair. See [`PRESET_HEADER`].
+/// `x-tts-option-<name>` is the contract's own spelling, with the name
+/// [`voices::DESCRIPTION_OPTION`] declares; the test below is what keeps this
+/// string and that name the same pair. Written out rather than joined at
+/// runtime because it is read once per request and a `HeaderMap` lookup wants a
+/// `&str` it does not have to own.
 const DESCRIPTION_HEADER: &str = "x-tts-option-voice_design_description";
 
-/// The voice the backend is configured to design, read off one request.
+/// The description behind [`voices::CUSTOM_VOICE_ID`], read off one request.
 ///
 /// Read per request rather than remembered from the load. The daemon reloads
 /// the model when an option changes, so remembering would usually work — but
@@ -381,9 +387,31 @@ const DESCRIPTION_HEADER: &str = "x-tts-option-voice_design_description";
 /// as text, so there is nothing a backend could recover from bytes that are not
 /// — and refusing the synthesis over it would take the voice away rather than
 /// fall back to it.
+/// The header the daemon injects this backend's sampling option under.
+///
+/// The same two spellings of one contract as [`DESCRIPTION_HEADER`], held
+/// together by the test below.
+const TEMPERATURE_HEADER: &str = "x-tts-option-temperature";
+
+/// The sampling temperature one request asks for, read off its headers.
+///
+/// Read per request rather than remembered from the load, and for the same
+/// reason as [`configured_voice`]: the header is what the contract says is
+/// authoritative, and a setting that only takes effect after several gigabytes
+/// are mapped again is a setting the user will think is broken. Nothing about
+/// this one needs a reload — it reaches the sampler and nothing else.
+fn configured_temperature(headers: &HeaderMap) -> Option<f32> {
+    let value = headers
+        .get(TEMPERATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    crate::model::temperature_option(value)
+}
+
 fn configured_voice(headers: &HeaderMap) -> Option<String> {
-    let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    voices::configured(value(PRESET_HEADER), value(DESCRIPTION_HEADER)).map(str::to_string)
+    let value = headers
+        .get(DESCRIPTION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    voices::configured(value).map(str::to_string)
 }
 
 /// `POST /v1/synthesize` body.
@@ -427,6 +455,7 @@ async fn synthesize(
     // Resolved here, where the headers are, rather than on the model thread:
     // the job sent there outlives this request's borrow of them.
     let configured = configured_voice(&headers);
+    let temperature = configured_temperature(&headers);
 
     // Validate and tokenize before the status line is sent. Once the response
     // is a 200 the only way to report a bad voice is an error frame, which the
@@ -443,6 +472,7 @@ async fn synthesize(
                     configured.as_deref(),
                     req.language.as_deref(),
                     req.instructions.as_deref(),
+                    temperature,
                 )
                 .map(|p| (p, sample_rate))
                 .map_err(Some)
@@ -843,47 +873,84 @@ mod tests {
         panic!("the load never reported a failure: {:?}", state.state());
     }
 
-    /// The headers and the option names are two spellings of one contract, and
+    /// The header and the option name are two spellings of one contract, and
     /// nothing but this holds them together: the daemon forms the header from
     /// the manifest's `name`, so a rename here that stopped short of the
     /// manifest would read an option nobody sets.
     #[test]
-    fn the_option_headers_are_the_declared_options() {
-        assert_eq!(
-            PRESET_HEADER,
-            format!("x-tts-option-{}", voices::PRESET_OPTION)
-        );
+    fn the_option_header_is_the_declared_option() {
         assert_eq!(
             DESCRIPTION_HEADER,
             format!("x-tts-option-{}", voices::DESCRIPTION_OPTION)
         );
     }
 
-    fn with_options(preset: Option<&str>, description: Option<&str>) -> HeaderMap {
+    /// The same contract for the sampling option, and the same reason to pin
+    /// it: the daemon forms the header from the manifest's `name`.
+    #[test]
+    fn the_temperature_header_is_the_declared_option() {
+        assert_eq!(
+            TEMPERATURE_HEADER,
+            format!("x-tts-option-{}", crate::model::TEMPERATURE_OPTION)
+        );
+    }
+
+    fn with_temperature(value: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        for (name, value) in [(PRESET_HEADER, preset), (DESCRIPTION_HEADER, description)] {
-            if let Some(value) = value {
-                headers.insert(
-                    HeaderName::from_static(name),
-                    value.parse().expect("a test header value must be valid"),
-                );
-            }
+        if let Some(value) = value {
+            headers.insert(
+                HeaderName::from_static(TEMPERATURE_HEADER),
+                value.parse().expect("a test header value must be valid"),
+            );
+        }
+        headers
+    }
+
+    /// An option the user has not set is no header at all, which has to leave
+    /// the checkpoint's own temperature alone rather than resolve to some
+    /// number this crate picked.
+    #[test]
+    fn no_temperature_header_overrides_nothing() {
+        assert_eq!(configured_temperature(&HeaderMap::new()), None);
+        assert_eq!(configured_temperature(&with_temperature(Some("   "))), None);
+    }
+
+    #[test]
+    fn a_declared_temperature_arrives_as_a_number() {
+        assert_eq!(
+            configured_temperature(&with_temperature(Some("0.7"))),
+            Some(0.7)
+        );
+    }
+
+    /// The daemon holds the dropdown, so this only sees a value stored before
+    /// the ladder was last edited or one written by hand. Either way the
+    /// checkpoint's own temperature is the safe answer, not a clamp to the
+    /// nearest end, which would speak at a setting nobody chose.
+    #[test]
+    fn a_temperature_off_the_ladder_is_refused() {
+        assert_eq!(configured_temperature(&with_temperature(Some("0.0"))), None);
+        assert_eq!(configured_temperature(&with_temperature(Some("12"))), None);
+        assert_eq!(
+            configured_temperature(&with_temperature(Some("warm"))),
+            None
+        );
+    }
+
+    fn with_description(description: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = description {
+            headers.insert(
+                HeaderName::from_static(DESCRIPTION_HEADER),
+                value.parse().expect("a test header value must be valid"),
+            );
         }
         headers
     }
 
     #[test]
-    fn a_picked_design_arrives_as_its_description() {
-        let configured = configured_voice(&with_options(Some("Deep narrator (male)"), None));
-        assert_eq!(
-            configured.as_deref(),
-            voices::design("Deep narrator (male)")
-        );
-    }
-
-    #[test]
-    fn a_written_description_beats_the_picked_design() {
-        let headers = with_options(Some("Deep narrator (male)"), Some("A hoarse pirate."));
+    fn a_written_description_arrives_as_itself() {
+        let headers = with_description(Some("A hoarse pirate."));
         assert_eq!(
             configured_voice(&headers).as_deref(),
             Some("A hoarse pirate.")
@@ -893,37 +960,42 @@ mod tests {
     /// The daemon omits the header for an option the user has not set, which is
     /// most requests to most backends.
     #[test]
-    fn no_option_headers_configure_no_voice() {
+    fn no_option_header_configures_no_voice() {
         assert_eq!(configured_voice(&HeaderMap::new()), None);
     }
 
-    /// A header this backend does not read must not disturb the two it does.
+    /// A field cleared back to empty is the field left alone, not an
+    /// instruction to describe nothing — Custom has to fall back to the default
+    /// rather than prompt the model with a blank.
+    #[test]
+    fn a_blank_description_configures_no_voice() {
+        assert_eq!(configured_voice(&with_description(Some("   "))), None);
+    }
+
+    /// A header this backend does not read must not disturb the one it does.
     #[test]
     fn an_unrelated_option_header_is_left_alone() {
-        let mut headers = with_options(Some("Soft whisper (female)"), None);
+        let mut headers = with_description(Some("A hoarse pirate."));
         headers.insert(
             HeaderName::from_static("x-tts-option-request_timeout_seconds"),
             "30".parse().unwrap(),
         );
         assert_eq!(
             configured_voice(&headers).as_deref(),
-            voices::design("Soft whisper (female)")
+            Some("A hoarse pirate.")
         );
     }
 
-    /// Bytes that are not text are read as no value at all, so the design the
-    /// user picked still speaks rather than the request failing over a header.
+    /// Bytes that are not text are read as no value at all, so Custom falls
+    /// back to the default rather than the request failing over a header.
     #[test]
     fn a_header_that_is_not_text_is_read_as_unset() {
-        let mut headers = with_options(Some("Soft whisper (female)"), None);
+        let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static(DESCRIPTION_HEADER),
             axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
         );
-        assert_eq!(
-            configured_voice(&headers).as_deref(),
-            voices::design("Soft whisper (female)")
-        );
+        assert_eq!(configured_voice(&headers), None);
     }
 
     /// The option only reaches the model through a request, so a synthesize
@@ -934,8 +1006,8 @@ mod tests {
         let (app, _) = app();
         let mut req = post("/v1/synthesize", &json!({ "text": "Hello." }));
         req.headers_mut().insert(
-            HeaderName::from_static(PRESET_HEADER),
-            "Deep narrator (male)".parse().unwrap(),
+            HeaderName::from_static(DESCRIPTION_HEADER),
+            "A hoarse pirate.".parse().unwrap(),
         );
         let (status, body) = call(app, req).await;
         assert_eq!(status, StatusCode::CONFLICT);

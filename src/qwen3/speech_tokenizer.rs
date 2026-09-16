@@ -456,6 +456,8 @@ pub struct Decoder {
     vocoder: Vocoder,
     num_quantizers: usize,
     total_upsample: usize,
+    /// See [`Decoder::context_frames`].
+    context_frames: Option<usize>,
 }
 
 #[derive(Module, Debug)]
@@ -480,15 +482,34 @@ impl Decoder {
                 convnext: ConvNeXtBlock::init(cfg.latent_dim, device),
             })
             .collect();
+        let pre_conv = CausalConv1d::init(cfg.codebook_dim, cfg.latent_dim, 3, 1, 1, 1, device);
+        // `padding` is the causal left padding of that convolution, in frames.
+        let context_frames = cfg
+            .sliding_window
+            .map(|window| window.saturating_sub(1).saturating_add(pre_conv.padding));
         Self {
             quantizer: SplitResidualVectorQuantizer::init(cfg, device),
-            pre_conv: CausalConv1d::init(cfg.codebook_dim, cfg.latent_dim, 3, 1, 1, 1, device),
+            pre_conv,
             pre_transformer: PreTransformer::init(cfg, device),
             upsample,
             vocoder: Vocoder::init(cfg, device),
             num_quantizers: cfg.num_quantizers,
             total_upsample: cfg.total_upsample(),
+            context_frames,
         }
+    }
+
+    /// Frames of history the last frame of a decode needs behind it to come out the same as
+    /// it would from a decode of the whole utterance, or `None` when no finite number does.
+    ///
+    /// Everything downstream of [`PreTransformer`] is causal and runs on upsampled samples,
+    /// so it reaches back well under a frame; what sets this is the transformer itself, whose
+    /// attention is restricted to a sliding window, and the causal `pre_conv` that feeds it —
+    /// the oldest frame the window reaches needs its own left padding to be real frames and
+    /// not the zeros a slice starting there would give it. With attention over the whole
+    /// sequence instead there is no such bound, and only a decode from the start matches.
+    pub fn context_frames(&self) -> Option<usize> {
+        self.context_frames
     }
 
     /// Decodes a chunk of codes with shape (B, num_quantizers, T) into audio
@@ -1073,6 +1094,12 @@ impl SpeechTokenizer {
 
     pub fn num_code_groups(&self) -> usize {
         self.model.decoder.num_quantizers
+    }
+
+    /// Frames of context a chunked decode has to carry for its result to match a decode of
+    /// the whole utterance; see [`Decoder::context_frames`].
+    pub fn decode_context_frames(&self) -> Option<usize> {
+        self.model.decoder.context_frames()
     }
 
     /// Decodes `frames` frames of `num_code_groups` codes, laid out frame by frame, into audio
