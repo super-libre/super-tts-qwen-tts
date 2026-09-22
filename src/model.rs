@@ -173,6 +173,20 @@ const STREAM_CHUNK_FRAMES: usize = 25;
 /// past it is paid for and not heard.
 const STREAM_CONTEXT_FRAMES: usize = 150;
 
+/// A seed for one request's sampling, drawn from the process's entropy.
+///
+/// The vendored [`GenerationConfig`] defaults to one fixed seed, which is what
+/// a demo wants: the same text plays the same way twice. A service must not.
+/// Sampling decides how an utterance comes out — a draw can fade, clip or
+/// rush — and with one seed the same sentence gets the same draw every time it
+/// is spoken, with no way out but changing the words; the reference
+/// implementation draws fresh noise on every call. The seed goes in the log
+/// with the utterance, so a draw worth studying can still be repeated.
+fn fresh_seed() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one(0u64)
+}
+
 /// The `[[options]]` entry a request's sampling temperature arrives under.
 ///
 /// The name is half a contract: `server.rs` reads the header the daemon spells
@@ -1225,6 +1239,7 @@ impl QwenTts {
     ) -> Result<Outcome> {
         let mut generation = GenerationConfig {
             max_new_tokens,
+            seed: fresh_seed(),
             ..Default::default()
         };
         // Only the talker's own sampling. The code predictor draws the codec's
@@ -1294,10 +1309,11 @@ impl QwenTts {
                 ControlFlow::Continue(())
             })
             .map_err(|e| anyhow!("generating speech: {e}"))?;
-        log::debug!(
-            "generated {} frames ({:.1}s)",
+        log::info!(
+            "generated {} frames ({:.1}s) from seed {:#x}",
             frames.len(),
-            seconds_of(frames.len(), frames_per_second)
+            seconds_of(frames.len(), frames_per_second),
+            generation.seed
         );
         if stopped {
             return Ok(Outcome::Stopped);
@@ -1608,6 +1624,15 @@ mod tests {
         assert_eq!(stream_context_frames(Some(150)), 150);
         assert_eq!(stream_context_frames(Some(580)), 150);
         assert_eq!(stream_context_frames(None), 150);
+    }
+
+    /// One text asked for twice is two draws, as it is from the reference; the
+    /// vendored default would make it one.
+    #[test]
+    fn every_request_draws_its_own_seed() {
+        let seeds: std::collections::HashSet<u64> = (0..16).map(|_| fresh_seed()).collect();
+        assert_eq!(seeds.len(), 16);
+        assert!(!seeds.contains(&GenerationConfig::default().seed));
     }
 
     /// The check that matters, on real weights: every chunk the stream hands
