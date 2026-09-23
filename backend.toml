@@ -13,7 +13,7 @@
 
 [backend]
     id = "app.super-tts.qwen-tts"
-    source = "github.com/jorge-menjivar/super-tts-qwen-tts"
+    source = "github.com/super-libre/super-tts-qwen-tts"
     name = "Qwen TTS"
     version = "0.1.0"
     kind = "subprocess"
@@ -130,6 +130,18 @@
     file = "qwen-tts-aarch64-unknown-linux-gnu-cpu.tar.gz"
     target = "aarch64-unknown-linux-gnu"
     accel = "cpu"
+
+# macOS on Apple Silicon. Metal compiles its kernels at runtime like the other
+# GPU builds, so it has nothing to select on beyond the target.
+[[assets.subprocess]]
+    file = "qwen-tts-aarch64-apple-darwin-cpu.tar.gz"
+    target = "aarch64-apple-darwin"
+    accel = "cpu"
+
+[[assets.subprocess]]
+    file = "qwen-tts-aarch64-apple-darwin-metal.tar.gz"
+    target = "aarch64-apple-darwin"
+    accel = "metal"
 
 # ---------------------------------------------------------------------------
 # The 0.6B CustomVoice checkpoint: the default. Nine voices, ten languages, and

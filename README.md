@@ -1,6 +1,6 @@
 # Super TTS — Qwen TTS backend
 
-[![coverage](https://img.shields.io/endpoint?url=https://jorge-menjivar.github.io/super-tts-qwen-tts/coverage.json)](https://jorge-menjivar.github.io/super-tts-qwen-tts/)
+[![coverage](https://img.shields.io/endpoint?url=https://super-libre.github.io/super-tts-qwen-tts/coverage.json)](https://super-libre.github.io/super-tts-qwen-tts/)
 
 Qwen's text-to-speech models as a subprocess backend for
 [Super TTS](https://github.com/jorge-menjivar/super-tts). Ten languages, 24 kHz
@@ -187,9 +187,10 @@ first audio 0.3 seconds into a request and synthesizes at about 6x real time —
 19 seconds of speech in 3.2. On a CPU it is slower than real time; the 0.6B
 model is the one to try without a GPU.
 
-Releases ship six builds: a CPU build for x86_64 and aarch64, CUDA 12 and
-CUDA 13, ROCm, and Vulkan. The daemon picks the one matching the machine, and
-ranks a native backend above Vulkan above the CPU. There is no
+Releases ship eight builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
+12 and CUDA 13, ROCm, and Vulkan. On Apple Silicon Macs: a CPU build and Metal.
+The daemon picks the one matching the machine, and ranks a native backend above
+Vulkan above the CPU. There is no
 compute-capability axis — see the manifest for why.
 
 Weights are downloaded by the daemon before the first load. This process has no
@@ -354,11 +355,12 @@ binary rather than a tool beside it.
 ### Building
 
 ```sh
-git clone https://github.com/jorge-menjivar/super-tts-qwen-tts
+git clone https://github.com/super-libre/super-tts-qwen-tts
 just build-release          # the pure-Rust CPU backend
 just build-cuda             # needs the CUDA headers — no GPU, no compute capability
 just build-rocm             # needs the ROCm headers
 just build-vulkan           # needs nothing; the loader is found at runtime
+just build-metal            # macOS; needs nothing beyond Xcode's SDK
 ```
 
 There is no submodule and no C toolchain to install. The first build is slow
