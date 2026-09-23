@@ -71,6 +71,20 @@ impl Sampling {
         self.draw_ops(logits, noise)
     }
 
+    /// The same sampling at another temperature.
+    ///
+    /// [`Sampling::ArgMax`] has none to set: it takes the largest logit, and
+    /// dividing every logit by the same positive number does not change which
+    /// one that is.
+    #[must_use]
+    pub fn with_temperature(self, temperature: f32) -> Self {
+        match self {
+            Sampling::ArgMax => Sampling::ArgMax,
+            Sampling::TopP { p, .. } => Sampling::TopP { p, temperature },
+            Sampling::TopKThenTopP { k, p, .. } => Sampling::TopKThenTopP { k, p, temperature },
+        }
+    }
+
     /// [`Sampling::draw`] as tensor operations.
     pub fn draw_ops(&self, logits: Tensor<1>, noise: Tensor<1>) -> Tensor<1, Int> {
         match *self {

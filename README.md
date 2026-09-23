@@ -65,31 +65,42 @@ the reference implementation does.
 
 ### Designed voices
 
-The VoiceDesign model has no preset voices. Its voice ids are a description:
+The VoiceDesign model builds its voice from a description rather than speaking
+with a recorded one, so a voice id can be a description:
 
 ```
 desc:A calm, deep male voice, speaking slowly with a warm tone.
 ```
 
-The settings app's voice picker cannot send one — it offers a model's declared
-voices, and this model declares none — so the description comes from the
-backend's own settings instead. Two options sit beside each other there:
+That is free text, and a picker cannot offer free text. So the twelve pre-made
+designs are declared as ordinary voices — *Neutral narrator (female)*,
+*Gravelly veteran (male)*, and ten more, six of each gender, each name saying
+which, because the name is all the picker shows. The manifest carries their ids
+and labels; `src/voices.rs` holds the sentence each id stands for, and a test
+there keeps the two lists the same twelve.
+
+Declared voices are what the settings app's picker offers, so they are chosen
+the way a CustomVoice speaker or a cloned voice is: per model, validated by the
+daemon against the model that has to resolve it, and stored without reloading
+the checkpoint.
+
+A thirteenth, `custom`, is the one whose wording is not fixed. It stands for
+whatever the backend's `voice_design_description` option is set to:
 
 | Option | Shape | What it does |
 |---|---|---|
-| `voice_design_preset` | dropdown | One of twelve pre-made voices — *Neutral narrator (female)*, *Gravelly veteran (male)*, and ten more, six of each gender. Each name says which, because the name is all the picker shows. The names are in the manifest; the sentence each stands for is in `src/voices.rs`. |
-| `voice_design_description` | text field | A description written by hand. Overrides the dropdown whenever it holds anything; clear it to go back to the list. |
+| `voice_design_description` | text field | The voice `custom` builds. Empty means `custom` speaks the same neutral description `default_voice` names, so clearing the field restores the default rather than prompting the model with a blank. |
 
-The daemon injects both as `x-tts-option-*` headers on every request, so a
-change takes effect on the next synthesis.
+The daemon injects it as an `x-tts-option-*` header on every request.
 
-Precedence runs from the most specific to the least: a request that carries its
-own `desc:` wins over both options, the text field wins over the dropdown, and a
-request with none of the three gets a neutral description — a prompt with no
-instruction at all leaves the voice to the sampler, and it would then differ from
-one request to the next.
+Precedence runs from the most specific to the least: a request carrying its own
+`desc:` wins over everything; a request naming one of the twelve gets that
+design, whatever the field says; `custom` gets the field, or the neutral
+description when it is empty; and a request naming no voice at all gets that
+same neutral description — a prompt with no instruction leaves the voice to the
+sampler, and it would then differ from one request to the next.
 
-The other four models ignore both options. A CustomVoice checkpoint conditions on
+The other four models ignore the option. A CustomVoice checkpoint conditions on
 one of its nine speakers and a Base one on a clone, so neither has anywhere to
 put a description, and refusing their requests over a setting left behind from a
 model the user has since switched away from would be the wrong answer.
@@ -98,7 +109,7 @@ model the user has since switched away from would be the wrong answer.
 
 The two Base checkpoints have no voices of their own: they speak in a voice
 cloned from a recording. The daemon registers that recording once per load over
-`POST /v1/voices` — mono `s16le` at 24 kHz, trimmed to the fifteen seconds the
+`POST /v1/voices` — mono `s16le` at 24 kHz, trimmed to the thirty seconds the
 manifest budgets — and later syntheses name the voice by its id alone.
 
 There are two ways to clone, and which one runs depends on whether the stored
@@ -117,6 +128,38 @@ serve perfectly well.
 A Base checkpoint asked for no voice at all is refused rather than answered.
 Conditioned on nothing it speaks in a voice that changes from one request to the
 next, and there is no default that could stand in for the one the caller meant.
+
+### Sampling
+
+The talker picks each frame of speech by sampling, so the same text spoken twice
+is not the same recording. How freely it picks is the backend's other option:
+
+| Option | Shape | What it does |
+|---|---|---|
+| `temperature` | dropdown, `0.6` – `1.2` | How freely the talker picks each frame. Unset leaves the `0.9` the checkpoints' own `generation_config.json` ships. |
+
+It is a dropdown rather than a box because the daemon refuses to store a value
+the manifest does not offer, and a temperature is exactly the setting where a
+typo is both easy and quiet: `0.09` parses, and speaks. The ladder ends where it
+does for a reason — under about 0.6 the talker starts repeating a frame until it
+reaches the generation cap, and over about 1.2 it wanders off the text.
+
+It reaches the talker and nothing else. The code predictor, which draws the
+codec's residual detail rather than the shape of the utterance, keeps what the
+checkpoint gave it; the reference implementation gives that its own
+`subtalker_temperature`, and one setting must not quietly move two.
+
+Lowering it is not a way to make the model faster or shorter. Measured over
+24 seeds × 40 sentences on the 1.7B CustomVoice checkpoint, the seed alone moves
+the silence between words by more than the audible part of this range does, so
+reach for it to change how the delivery *feels*, not to fix a particular
+utterance you did not like.
+
+**The seed is fixed** at `299792458`, in `GenerationConfig`. It is what makes a
+request reproducible: the same text, voice and temperature give the same audio
+every time. It is not tuned, and there is nothing to tune — a sweep of 24 seeds
+found the shipped one exactly median, and the best seed on half the sentences
+was worth about 5% of the silence on the other half.
 
 ### What is not here
 

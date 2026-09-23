@@ -26,56 +26,40 @@
     # Required to be empty for subprocess backends; the transport has no network.
     allowed_hosts = []
 
-# The voice for the VoiceDesign checkpoint, which is the one model here that has
-# no speakers of its own — it builds a voice from a sentence describing it. Every
-# other model ignores both options: a CustomVoice checkpoint conditions on one of
-# its nine speakers and a Base one on a clone, so neither has anywhere to put a
-# description, and handing one a description the user set for a different model
-# would refuse every request rather than sound different.
+# The one option this backend declares: the wording behind the VoiceDesign
+# checkpoint's `custom` voice.
 #
-# These are options rather than `[[models.voices]]` because a description is not
-# a voice id the daemon can validate: the twelve below are a starting point, not
-# the set of voices the checkpoint has. `voice_kinds = ["described"]` is what
-# still lets a caller pass its own `desc:<text>` per request, and a request that
-# does wins over both of these — see src/voices.rs.
+# Which voice a model speaks in is not an option — it is a voice id, declared
+# per model under `[[models.voices]]` and stored per model by the daemon, which
+# validates a pick against the model that has to resolve it and needs no reload
+# to change one. An option is neither: it is one value for the whole backend, so
+# every other model here would see a setting it can only ignore, and writing one
+# reloads the checkpoint.
+#
+# What is left is the half a voice list cannot hold. The twelve designs are
+# fixed wording and are voices; this is the sentence the user writes, and a
+# free-text field is not a picker entry. So `custom` is a declared voice like
+# any other and this option is what it stands for — see src/voices.rs.
 
-[[options]]
-    name = "voice_design_preset"
-    label = "Designed voice"
-    description = "The voice the Voice Design model builds. Ignored by the other models, which speak with a preset or a cloned voice."
-    type = "string"
-    default = "Neutral narrator (female)"
-    # The names, not the descriptions: an option's `choices` are the values the
-    # daemon stores and the dropdown shows, and twelve sentences in a picker is
-    # not a picker. src/voices.rs holds the description each one stands for, and
-    # a test there asserts this list and that table are the same twelve.
-    #
-    # Each name says whether the voice is female or male, the way the nine
-    # CustomVoice speakers below do, because the name is the whole of what the
-    # picker shows — six of each, and the description behind each one says it
-    # again, since that is the half the model actually reads.
-    choices = [
-        "Neutral narrator (female)",
-        "Warm storyteller (female)",
-        "Deep narrator (male)",
-        "Bright presenter (female)",
-        "Calm documentary (male)",
-        "Friendly assistant (male)",
-        "News anchor (male)",
-        "Gravelly veteran (male)",
-        "Soft whisper (female)",
-        "Cheerful child (female)",
-        "Elegant host (female)",
-        "Dramatic trailer (male)",
-    ]
-
-# Deliberately without `choices`: this is the free-text half, and declaring any
-# would turn it into a second dropdown and refuse every voice a user wrote.
+# Deliberately without `choices`: this is free text, and declaring any would
+# turn it into a dropdown and refuse every voice a user wrote. It is the one
+# thing about a voice that could not become a `[[models.voices]]` entry, which
+# is why it is the one thing still declared here.
 [[options]]
     name = "voice_design_description"
     label = "Custom voice description"
-    description = "Describe the voice in your own words, e.g. 'A hoarse, weary sailor speaking slowly'. Overrides the designed voice above whenever it is set; clear it to go back to the list."
+    description = "The voice the Voice Design model builds when its voice is set to Custom. Describe it in your own words, e.g. 'A hoarse, weary sailor speaking slowly'; leave it empty to fall back to the default voice. Ignored by the other models, which speak with a preset or a cloned voice."
     type = "string"
+
+[[options]]
+    name = "temperature"
+    label = "Temperature"
+    description = "How freely the model picks each frame of speech. Lower is steadier and more literal, higher is more varied and more willing to pause mid-sentence. It steers delivery and pacing; the codec that turns the chosen frames into sound keeps its own setting either way."
+    type = "float"
+    default = 0.9
+    min = 0.6
+    max = 1.2
+    step = 0.1
 
 # One entry per tarball `.github/workflows/release.yml` builds — the filenames
 # must match it exactly, since the indexer resolves them against the release's
@@ -337,16 +321,26 @@
     estimated_vram_bytes = 6442450944
     max_input_chars = 500
     output_sample_rate = 24000
-    # Described only, so there are no `[[models.voices]]` and no `default_voice`
-    # to name. A voice id is `desc:` followed by the description, e.g.
-    # `desc:A calm, deep male voice speaking slowly.` A request that names no
-    # voice — which is every request the settings app sends, since its voice
-    # picker has no `[[models.voices]]` here to offer — gets the voice the two
-    # `[[options]]` at the top of this file are set to, and the neutral
-    # description in src/voices.rs when they are set to nothing. A prompt with no
+    # Both kinds. `described` is what the checkpoint actually is — a voice id
+    # can be `desc:` followed by any description, e.g. `desc:A calm, deep male
+    # voice speaking slowly.`, and a request carrying one wins over everything
+    # below. `preset` is what makes that reachable from a voice picker: the
+    # twelve designs are declared as ordinary voices, so they are listed, stored
+    # per model and validated exactly like a CustomVoice speaker or a clone,
+    # rather than living in a backend-wide option every other model had to
+    # ignore. src/voices.rs holds the description each id stands for, and a test
+    # there asserts this list and that table are the same twelve.
+    #
+    # `custom` is the thirteenth, and the only one whose description is not
+    # fixed: it stands for whatever `voice_design_description` below is set to.
+    # That half stays an option because it is free text, and a sentence the user
+    # writes is not a picker entry. Set to nothing it resolves to the same
+    # neutral description `default_voice` names, so picking Custom and writing
+    # nothing is the voice a user who picked nothing gets — a prompt with no
     # instruction at all leaves the voice to the sampler, and it would then
     # differ from one request to the next.
-    voice_kinds = ["described"]
+    voice_kinds = ["preset", "described"]
+    default_voice = "neutral-narrator-female"
     files = [
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/config.json", destination = "models/qwen3-tts-1.7b-voice-design/config.json", sha256 = "aecd2cc4c1fe9edef1cb7ca7c401685a43879ad43f3f9e883f1c6760b61731e0" },
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/model.safetensors", destination = "models/qwen3-tts-1.7b-voice-design/model.safetensors", sha256 = "391e8db219f292c515297cdceeb43e4eae67cdde35fa57e79a6a8a532fca0522" },
@@ -354,6 +348,78 @@
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/resolve/main/speech_tokenizer/model.safetensors", destination = "models/qwen3-tts-1.7b-voice-design/speech_tokenizer/model.safetensors", sha256 = "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258" },
         { url = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json", destination = "models/qwen3-tts-1.7b-voice-design/tokenizer.json", sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4" },
     ]
+
+    # The twelve pre-made designs. No `language` on any of them: a description
+    # steers timbre and delivery, not pronunciation, so every one of these speaks
+    # whichever of the ten languages above the request asks for.
+
+    [[models.voices]]
+        id = "neutral-narrator-female"
+        label = "Neutral narrator (female)"
+        tags = ["female", "neutral", "narration"]
+
+    [[models.voices]]
+        id = "warm-storyteller-female"
+        label = "Warm storyteller (female)"
+        tags = ["female", "warm", "storytelling"]
+
+    [[models.voices]]
+        id = "deep-narrator-male"
+        label = "Deep narrator (male)"
+        tags = ["male", "deep", "cinematic"]
+
+    [[models.voices]]
+        id = "bright-presenter-female"
+        label = "Bright presenter (female)"
+        tags = ["female", "bright", "energetic"]
+
+    [[models.voices]]
+        id = "calm-documentary-male"
+        label = "Calm documentary (male)"
+        tags = ["male", "calm", "documentary"]
+
+    [[models.voices]]
+        id = "friendly-assistant-male"
+        label = "Friendly assistant (male)"
+        tags = ["male", "friendly", "conversational"]
+
+    [[models.voices]]
+        id = "news-anchor-male"
+        label = "News anchor (male)"
+        tags = ["male", "crisp", "news"]
+
+    [[models.voices]]
+        id = "gravelly-veteran-male"
+        label = "Gravelly veteran (male)"
+        tags = ["male", "gravelly", "older"]
+
+    [[models.voices]]
+        id = "soft-whisper-female"
+        label = "Soft whisper (female)"
+        tags = ["female", "soft", "whisper"]
+
+    [[models.voices]]
+        id = "cheerful-child-female"
+        label = "Cheerful child (female)"
+        tags = ["female", "child", "playful"]
+
+    [[models.voices]]
+        id = "elegant-host-female"
+        label = "Elegant host (female)"
+        tags = ["female", "elegant", "polished"]
+
+    [[models.voices]]
+        id = "dramatic-trailer-male"
+        label = "Dramatic trailer (male)"
+        tags = ["male", "dramatic", "trailer"]
+
+    # The written-it-yourself voice. Its description lives in the
+    # `voice_design_description` option rather than here, because it is the one
+    # entry whose wording the user supplies.
+    [[models.voices]]
+        id = "custom"
+        label = "Custom"
+        tags = ["custom", "described"]
 
 # The Base checkpoints, which are the family that clones. They have no speakers
 # of their own and take no description: a request names a voice the user cloned,
@@ -378,11 +444,16 @@
     estimated_vram_bytes = 3758096384
     max_input_chars = 500
     output_sample_rate = 24000
-    # Fifteen seconds of reference audio. Long enough for a speaker embedding to
-    # settle, and short enough that the in-context example it also becomes — 188
-    # codec frames — does not crowd the prefix of every sentence that follows.
+    # Thirty seconds of reference audio: the ceiling the Qwen3-TTS wrappers
+    # auto-trim to, and the point past which a talker that never emits its
+    # end-of-speech token is the reported failure. Quality plateaus long before
+    # it — ten to fifteen seconds is where a speaker embedding settles — but the
+    # in-context example the clip also becomes costs only its own prefill, 375
+    # codec frames against a 32768-position context, which is a few percent of a
+    # sentence and not the reason to clip a longer reading. So this is a ceiling
+    # rather than a target: a clip is trimmed to it, never padded up to it.
     voice_kinds = ["cloned"]
-    clone_ref_seconds = 15.0
+    clone_ref_seconds = 30.0
     files = [
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/config.json", destination = "models/qwen3-tts-0.6b-base/config.json", sha256 = "2e714c787c8edb98b05432685cddb634add2de4d4e645f653d68251ef72ba011" },
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base/resolve/main/model.safetensors", destination = "models/qwen3-tts-0.6b-base/model.safetensors", sha256 = "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6" },
@@ -402,7 +473,7 @@
     max_input_chars = 500
     output_sample_rate = 24000
     voice_kinds = ["cloned"]
-    clone_ref_seconds = 15.0
+    clone_ref_seconds = 30.0
     files = [
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/config.json", destination = "models/qwen3-tts-1.7b-base/config.json", sha256 = "b4f01752d15a488abde3e1ab44723ae4f4b9e68a4037257b098b3737893cc1f9" },
         { url = "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/resolve/main/model.safetensors", destination = "models/qwen3-tts-1.7b-base/model.safetensors", sha256 = "38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c" },

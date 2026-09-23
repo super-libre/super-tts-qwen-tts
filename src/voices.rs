@@ -89,34 +89,47 @@ pub fn parse(voice: Option<&str>) -> Requested<'_> {
 pub const DEFAULT_DESCRIPTION: &str =
     "A clear, neutral female voice speaking at a natural pace, with even tone.";
 
-/// The `[[options]]` name carrying a pick from [`DESIGNS`].
+/// The voice id standing for "whatever the description option says".
+///
+/// The twelve designs are voices with fixed wording; this one is the voice
+/// whose wording the user writes. It is a declared `[[models.voices]]` id like
+/// any other, so picking it is a per-model voice preference the daemon
+/// validates and stores — where the description it stands for stays a backend
+/// option, because it is free text and an option is what this backend already
+/// has a field for.
+///
+/// With the field empty it resolves to [`DEFAULT_DESCRIPTION`], which is also
+/// what the manifest's `default_voice` names: choosing Custom and writing
+/// nothing is the same voice as choosing nothing at all, rather than a prompt
+/// with no instruction in it.
+pub const CUSTOM_VOICE_ID: &str = "custom";
+
+/// The `[[options]]` name carrying a description written out by hand.
 ///
 /// Only the tests read it — at runtime the name reaches this backend already
 /// spelled as a header, and `server.rs` holds that spelling so a lookup costs
 /// no allocation. The tests either side are what hold the two together, the
 /// way [`crate::lang`] holds its table to the manifest's language list.
 #[cfg(test)]
-pub const PRESET_OPTION: &str = "voice_design_preset";
-
-/// The `[[options]]` name carrying a description written out by hand.
-/// Read only by the tests, like [`PRESET_OPTION`].
-#[cfg(test)]
 pub const DESCRIPTION_OPTION: &str = "voice_design_description";
 
-/// The pre-made voices a VoiceDesign checkpoint offers, as `(name,
+/// The pre-made voices a VoiceDesign checkpoint offers, as `(id, label,
 /// description)`.
 ///
-/// The name is what the settings dropdown shows and what the daemon stores and
-/// injects, since an option's `choices` are values and not labels; the
-/// description is what the model is actually conditioned on. Writing the
-/// descriptions here rather than into the manifest keeps the dropdown readable
-/// — twelve sentences in a picker is not a picker — and keeps the wording that
-/// steers the model in the same file as the default it falls back to.
+/// The id is the voice id a request carries and the daemon stores; the label
+/// is what the picker shows; the description is what the model is actually
+/// conditioned on. Writing the descriptions here rather than into the manifest
+/// keeps the picker readable — twelve sentences in a picker is not a picker —
+/// and keeps the wording that steers the model in the same file as the default
+/// it falls back to.
 ///
-/// `backend.toml` carries the names as the `voice_design_preset` option's
-/// `choices`, and a test below holds the two lists together: a name only this
-/// table knows is one the daemon would refuse before it ever arrived, and a
-/// choice only the manifest knows is one that resolves to nothing.
+/// `backend.toml` carries the ids and labels as this model's
+/// `[[models.voices]]`, which is what makes them ordinary voices: the daemon
+/// lists them beside a CustomVoice checkpoint's speakers and a Base one's
+/// clones, validates a pick against them, and stores it per model. A test below
+/// holds the two lists together: an id only this table knows is one the daemon
+/// would refuse before it ever arrived, and one only the manifest knows is one
+/// that resolves to nothing.
 ///
 /// The spread is deliberate — gender, pitch, pace, age and setting each vary
 /// across the twelve, six voices to a gender — because a list of twelve
@@ -130,108 +143,114 @@ pub const DESCRIPTION_OPTION: &str = "voice_design_description";
 /// the user picking blind, and the description is the whole of what the model
 /// reads, so one that did not say would leave the choice to the sampler and
 /// hand back a different gender from one request to the next.
-pub const DESIGNS: [(&str, &str); 12] = [
-    ("Neutral narrator (female)", DEFAULT_DESCRIPTION),
+pub const DESIGNS: [(&str, &str, &str); 12] = [
     (
+        "neutral-narrator-female",
+        "Neutral narrator (female)",
+        DEFAULT_DESCRIPTION,
+    ),
+    (
+        "warm-storyteller-female",
         "Warm storyteller (female)",
         "A warm, gentle female voice reading unhurriedly, with soft rounded \
          vowels and a kind, inviting tone.",
     ),
     (
+        "deep-narrator-male",
         "Deep narrator (male)",
         "A deep, resonant male voice speaking slowly and calmly, with steady \
          breath and a measured, cinematic delivery.",
     ),
     (
+        "bright-presenter-female",
         "Bright presenter (female)",
         "A bright, energetic young female voice speaking quickly and clearly, \
          with lively pitch and an upbeat, confident tone.",
     ),
     (
+        "calm-documentary-male",
         "Calm documentary (male)",
         "A composed male voice speaking quietly and precisely, with careful \
          diction and long, even phrases.",
     ),
     (
+        "friendly-assistant-male",
         "Friendly assistant (male)",
         "A friendly, conversational male voice at a moderate pace, relaxed and \
          approachable, as if speaking to someone across a table.",
     ),
     (
+        "news-anchor-male",
         "News anchor (male)",
         "A crisp, authoritative male voice with clean articulation and a level, \
          professional cadence, projecting without strain.",
     ),
     (
+        "gravelly-veteran-male",
         "Gravelly veteran (male)",
         "A rough, gravelly older male voice speaking slowly, weathered and low, \
          with a dry, unhurried delivery.",
     ),
     (
+        "soft-whisper-female",
         "Soft whisper (female)",
         "A soft, breathy female voice speaking barely above a whisper, close to \
          the microphone, intimate and hushed.",
     ),
     (
+        "cheerful-child-female",
         "Cheerful child (female)",
         "A light, high-pitched young girl's voice, playful and quick, full of \
          curiosity and bounce.",
     ),
     (
+        "elegant-host-female",
         "Elegant host (female)",
         "A poised, refined female voice speaking smoothly and unhurriedly, with \
          polished diction and a hint of warmth.",
     ),
     (
+        "dramatic-trailer-male",
         "Dramatic trailer (male)",
         "A powerful, theatrical male voice speaking with heavy emphasis and long \
          pauses, dark and intense.",
     ),
 ];
 
-/// The description a pre-made voice's name stands for.
+/// The description a pre-made voice's id stands for.
 ///
-/// Matched exactly, bar surrounding whitespace: the daemon refuses a write of
-/// any value the manifest's `choices` do not offer, so the name that arrives is
-/// one of these or the option was set by something that bypassed that check.
+/// Matched exactly, bar surrounding whitespace: the daemon refuses a voice the
+/// model does not declare, so the id that arrives is one of these or the
+/// request came from something that bypassed that check.
 #[must_use]
-pub fn design(name: &str) -> Option<&'static str> {
-    let name = name.trim();
+pub fn design(id: &str) -> Option<&'static str> {
+    let id = id.trim();
     DESIGNS
         .iter()
-        .find(|(offered, _)| *offered == name)
-        .map(|(_, description)| *description)
+        .find(|(offered, _, _)| *offered == id)
+        .map(|(_, _, description)| *description)
 }
 
-/// The voice the backend's configuration asks for, from the two options it
-/// declares.
+/// The description the backend is configured with, if any.
 ///
-/// `description` wins whenever it holds anything. It is the more specific of
-/// the two — a sentence the user wrote against a name they merely picked — and
-/// the manifest says so where they set it, so a description left in the field
-/// overriding a dropdown they later moved is what they were told to expect.
+/// One option rather than the two this backend used to declare: which voice a
+/// model speaks in is now a voice id the daemon stores per model, and only the
+/// free-text half — the sentence behind [`CUSTOM_VOICE_ID`] — is left with
+/// nowhere else to live. A picker's worth of fixed choices is a voice list; a
+/// sentence the user writes is not.
 ///
-/// A preset naming no known design resolves to nothing rather than to the
-/// default, so the model's own fallback is what fills in. Both answers sound
-/// the same today, since the default *is* the first design; they stop being the
-/// same the moment a request carries its own description, which the caller
-/// would then lose to a stale pick.
+/// A blank field is the field left alone, not an instruction to say nothing:
+/// an empty description steers the model nowhere, so it resolves to `None` and
+/// the caller falls back to [`DEFAULT_DESCRIPTION`].
 #[must_use]
-pub fn configured<'a>(preset: Option<&str>, description: Option<&'a str>) -> Option<&'a str> {
-    if let Some(written) = description.map(str::trim).filter(|d| !d.is_empty()) {
-        return Some(written);
-    }
-    let preset = preset.map(str::trim).filter(|p| !p.is_empty())?;
-    let found = design(preset);
-    if found.is_none() {
-        log::warn!("ignoring the configured voice {preset:?}, which is not one this backend has");
-    }
-    found
+pub fn configured(description: Option<&str>) -> Option<&str> {
+    description.map(str::trim).filter(|d| !d.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest_probe::{declared_choices, option_body, option_value};
 
     #[test]
     fn a_bare_id_is_a_preset_speaker() {
@@ -289,17 +308,22 @@ mod tests {
 
     #[test]
     fn a_design_resolves_to_its_description() {
+        assert_eq!(design("neutral-narrator-female"), Some(DEFAULT_DESCRIPTION));
         assert_eq!(
-            design("Neutral narrator (female)"),
-            Some(DEFAULT_DESCRIPTION)
+            design("  deep-narrator-male  "),
+            design("deep-narrator-male")
         );
-        assert_eq!(
-            design("  Deep narrator (male)  "),
-            design("Deep narrator (male)")
-        );
-        assert!(design("Deep narrator (male)").is_some_and(|d| d.contains("resonant")));
-        assert_eq!(design("Ryan"), None);
+        assert!(design("deep-narrator-male").is_some_and(|d| d.contains("resonant")));
+        assert_eq!(design("ryan"), None);
         assert_eq!(design(""), None);
+    }
+
+    /// Custom is deliberately not in the table: it is the id whose description
+    /// comes from the option, so resolving it here would give it fixed wording
+    /// and make the field it reads do nothing.
+    #[test]
+    fn the_custom_voice_resolves_to_no_fixed_design() {
+        assert_eq!(design(CUSTOM_VOICE_ID), None);
     }
 
     /// Both halves of a design have to name its gender: the name is all the
@@ -309,7 +333,7 @@ mod tests {
     /// against.
     #[test]
     fn every_design_names_its_gender() {
-        for (name, description) in DESIGNS {
+        for (_, name, description) in DESIGNS {
             let gender = if name.ends_with("(female)") {
                 "female"
             } else if name.ends_with("(male)") {
@@ -333,7 +357,7 @@ mod tests {
     fn the_designs_offer_both_genders() {
         let women = DESIGNS
             .iter()
-            .filter(|(name, _)| name.ends_with("(female)"))
+            .filter(|(_, name, _)| name.ends_with("(female)"))
             .count();
         assert_eq!(women, DESIGNS.len() - women, "{women} of {}", DESIGNS.len());
     }
@@ -342,14 +366,30 @@ mod tests {
     /// a name would make the dropdown's second copy unreachable.
     #[test]
     fn the_designs_are_distinct_and_populated() {
-        for (name, description) in DESIGNS {
+        for (id, name, description) in DESIGNS {
             assert!(!name.trim().is_empty(), "a design has no name");
+            // The id is a wire value now — it travels in a request and is
+            // stored in the daemon's config — so it has to be the kind of
+            // token that survives both, not a sentence with spaces in it.
+            assert!(
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b == b'-' || b.is_ascii_digit()),
+                "{id} is not a plain lowercase id"
+            );
+            assert_ne!(id, CUSTOM_VOICE_ID, "a design may not shadow Custom");
+            assert_eq!(
+                DESIGNS.iter().filter(|(i, _, _)| *i == id).count(),
+                1,
+                "{id} is declared twice"
+            );
             assert!(
                 description.len() > 30,
                 "{name} is described in too few words to steer the model"
             );
             assert_eq!(
-                DESIGNS.iter().filter(|(n, _)| *n == name).count(),
+                DESIGNS.iter().filter(|(_, n, _)| *n == name).count(),
                 1,
                 "{name} is offered twice"
             );
@@ -357,83 +397,72 @@ mod tests {
     }
 
     #[test]
-    fn a_picked_design_is_the_configured_voice() {
+    fn a_written_description_is_the_configured_voice() {
         assert_eq!(
-            configured(Some("Deep narrator (male)"), None),
-            design("Deep narrator (male)")
-        );
-    }
-
-    /// The field the manifest calls an override has to override.
-    #[test]
-    fn a_written_description_beats_the_picked_design() {
-        assert_eq!(
-            configured(Some("Deep narrator (male)"), Some("A hoarse pirate.")),
+            configured(Some("A hoarse pirate.")),
             Some("A hoarse pirate.")
         );
     }
 
     /// An empty field is the field left alone, not an instruction to say
-    /// nothing — clearing it has to give the dropdown back.
+    /// nothing — Custom has to fall back to the default rather than prompt the
+    /// model with a blank.
     #[test]
-    fn a_blank_description_leaves_the_design_in_charge() {
-        assert_eq!(
-            configured(Some("Deep narrator (male)"), Some("   ")),
-            design("Deep narrator (male)")
-        );
-        assert_eq!(
-            configured(Some("Deep narrator (male)"), Some("")),
-            design("Deep narrator (male)")
-        );
+    fn a_blank_description_asks_for_nothing() {
+        assert_eq!(configured(Some("   ")), None);
+        assert_eq!(configured(Some("")), None);
     }
 
     #[test]
     fn configuring_nothing_asks_for_nothing() {
-        assert_eq!(configured(None, None), None);
-        assert_eq!(configured(Some("  "), Some("  ")), None);
-    }
-
-    /// A pick this backend does not have resolves to nothing, which leaves the
-    /// model's own default in charge rather than a design chosen at random.
-    #[test]
-    fn an_unknown_design_is_ignored() {
-        assert_eq!(configured(Some("Sea captain"), None), None);
+        assert_eq!(configured(None), None);
     }
 
     /// A description survives whitespace the settings field picked up.
     #[test]
     fn a_written_description_is_trimmed() {
         assert_eq!(
-            configured(None, Some("  A hoarse pirate.  ")),
+            configured(Some("  A hoarse pirate.  ")),
             Some("A hoarse pirate.")
         );
     }
 
-    /// The manifest and this table have to agree, or the daemon will refuse a
-    /// name only this table knows, and store a choice only the manifest knows.
+    /// The manifest and this table have to agree, or the daemon will refuse an
+    /// id only this table knows, and store one only the manifest knows — and
+    /// the second is the worse half, since it is stored successfully and then
+    /// resolves to nothing on every request.
+    ///
+    /// Ids and labels both: the id is what travels, and the label is the whole
+    /// of what the picker shows, so a table that held the gender and a manifest
+    /// that did not would leave the user picking blind.
     #[test]
-    fn the_designs_match_what_the_manifest_offers() {
+    fn the_designs_match_what_the_manifest_declares() {
         let manifest = include_str!("../backend.toml");
-        let declared = declared_choices(manifest, PRESET_OPTION)
-            .expect("backend.toml declares the preset option's choices");
-        let ours: Vec<&str> = DESIGNS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(ours, declared);
+        let declared = declared_voices(manifest, DESIGN_MODEL);
+        let ours: Vec<(&str, &str)> = DESIGNS.iter().map(|(id, l, _)| (*id, *l)).collect();
+        let (custom, designs) = declared
+            .split_last()
+            .expect("backend.toml declares the design model's voices");
+        assert_eq!(ours, designs);
+        // Custom is declared alongside them and deliberately absent from the
+        // table: it is the one whose description the option carries.
+        assert_eq!(custom.0, CUSTOM_VOICE_ID);
     }
 
-    /// The manifest's default is what the daemon injects for a user who has
-    /// picked nothing, so it has to be a design — and the same one the model
-    /// falls back to when no option arrives at all, or the voice would change
-    /// depending on whether the daemon happened to send the header.
+    /// The manifest's `default_voice` is what a request naming none resolves
+    /// to, so it has to be a design — and the same one Custom falls back to
+    /// with an empty field, or clearing the field would change the voice
+    /// rather than restore it.
     #[test]
     fn the_manifests_default_design_is_the_default_description() {
         let manifest = include_str!("../backend.toml");
-        let default = option_field(manifest, PRESET_OPTION, "default")
-            .expect("backend.toml gives the preset option a default");
+        let default = model_field(manifest, DESIGN_MODEL, "default_voice")
+            .expect("backend.toml gives the design model a default_voice");
         assert_eq!(design(default), Some(DEFAULT_DESCRIPTION));
     }
 
     /// The free-text field must not declare choices — declaring any would turn
-    /// it into a second dropdown and refuse every description a user wrote.
+    /// it into a dropdown and refuse every description a user wrote.
     #[test]
     fn the_description_option_is_a_free_text_field() {
         let manifest = include_str!("../backend.toml");
@@ -441,64 +470,52 @@ mod tests {
         assert_eq!(declared_choices(manifest, DESCRIPTION_OPTION), None);
     }
 
-    /// The `[[options]]` block declaring `name`, as its own lines.
+    /// The checkpoint the designs belong to. Only the tests name it: at
+    /// runtime a request is already addressed to one model, and this crate
+    /// tells the three families apart by what the checkpoint is, not by what
+    /// the manifest called it.
+    const DESIGN_MODEL: &str = "qwen3-tts-1.7b-voice-design";
+
+    /// The `[[models]]` block declaring `name`, up to the next top-level table.
     ///
-    /// Parsed rather than deserialized because the manifest is the schema's
-    /// shape and not this crate's: pulling in a TOML dependency to read two
-    /// fields would make the test depend on a type it does not own.
-    fn option_body<'a>(manifest: &'a str, name: &str) -> Option<Vec<&'a str>> {
-        let mut blocks = manifest.split("[[options]]").skip(1);
-        blocks.find_map(|block| {
-            let lines: Vec<&str> = block
-                .lines()
-                .take_while(|l| !l.trim_start().starts_with('['))
-                .collect();
-            lines
-                .iter()
-                .any(|l| option_value(l, "name").is_some_and(|v| v == name))
-                .then_some(lines)
-        })
+    /// Sub-tables are kept: `[[models.voices]]` is part of the model, and
+    /// stopping at the first `[` would cut every voice off the entry.
+    fn model_body<'a>(manifest: &'a str, name: &str) -> Option<&'a str> {
+        manifest
+            .split("\n[[models]]")
+            .skip(1)
+            .map(|block| block.split("\n[[").next().unwrap_or(block))
+            .find(|block| {
+                block
+                    .lines()
+                    .any(|l| option_value(l, "name").is_some_and(|v| v == name))
+            })
     }
 
-    /// One `key = "value"` from an option's block, unquoted.
-    fn option_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        let (found, value) = line.trim().split_once('=')?;
-        (found.trim() == key).then(|| value.trim().trim_matches('"'))
-    }
-
-    /// One scalar field of the option named `name`.
-    fn option_field<'a>(manifest: &'a str, name: &str, key: &str) -> Option<&'a str> {
-        option_body(manifest, name)?
-            .into_iter()
+    /// One scalar field of the model named `name`, from its own lines rather
+    /// than a sub-table's.
+    fn model_field<'a>(manifest: &'a str, name: &str, key: &str) -> Option<&'a str> {
+        model_body(manifest, name)?
+            .split("[[models.voices]]")
+            .next()?
+            .lines()
             .find_map(|l| option_value(l, key))
     }
 
-    /// The `choices` the option named `name` offers, in the order it lists
-    /// them, or `None` when it declares none.
-    ///
-    /// Walks the lines rather than joining them: the list is written one entry
-    /// to a line, and a joined copy would be a `String` this cannot hand
-    /// slices of back to its caller.
-    fn declared_choices<'a>(manifest: &'a str, name: &str) -> Option<Vec<&'a str>> {
-        let body = option_body(manifest, name)?;
-        let opens = body
-            .iter()
-            .position(|l| option_value(l, "choices").is_some())?;
-        let mut choices = Vec::new();
-        for line in &body[opens..] {
-            let line = line.split_once('[').map_or(*line, |(_, rest)| rest);
-            let (line, closes) = line
-                .split_once(']')
-                .map_or((line, false), |(entries, _)| (entries, true));
-            choices.extend(
-                line.split(',')
-                    .map(|c| c.trim().trim_matches('"'))
-                    .filter(|c| !c.is_empty()),
-            );
-            if closes {
-                return Some(choices);
-            }
-        }
-        None
+    /// The `(id, label)` of every `[[models.voices]]` the model declares, in
+    /// the order it declares them.
+    fn declared_voices<'a>(manifest: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
+        let Some(body) = model_body(manifest, name) else {
+            return Vec::new();
+        };
+        body.split("[[models.voices]]")
+            .skip(1)
+            .filter_map(|entry| {
+                let lines: Vec<&str> = entry.lines().collect();
+                let id = lines.iter().find_map(|l| option_value(l, "id"))?;
+                let label = lines.iter().find_map(|l| option_value(l, "label"))?;
+                Some((id, label))
+            })
+            .collect()
     }
 }
