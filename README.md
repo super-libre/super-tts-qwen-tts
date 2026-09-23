@@ -265,13 +265,13 @@ warm cache as a *bundle*, and this backend ships one in `kernels/`, inside the
 release tarball beside the binary.
 
 What it holds is the tuning, not the compiled kernels. On an RTX 3090 that is
-147 MB of PTX against **996 KB** of autotune results — and the small half is
+147 MB of PTX against **904 KB** of autotune results — and the small half is
 both the expensive one to produce and the durable one:
 
 | | size | cost to redo | survives a rebuild |
 |---|---:|---|---|
 | Compiled kernels (PTX) | 147 MB | under a minute | no — keyed by the source that generated them |
-| Autotune results | 996 KB | the rest of the four minutes | yes — keyed by operation and shape |
+| Autotune results | 904 KB | the rest of the four minutes | yes — keyed by operation and shape |
 
 So the bundle is autotune-only. Shipping the PTX as well would multiply the
 tarball by 160 to save the minute, and it would have to be rebuilt and
@@ -293,15 +293,17 @@ first:
 
 Each model after the first costs a fraction of it, and the last adds nothing at
 all: only the jump from 0.6B to 1.7B brings genuinely new shapes. All five
-together are 288 entries and 996 KB, against 261 and 900 KB for `0.6b-base`
-alone — so covering the whole backend costs about 96 KB more than covering one
-model of it. Entries for a device this machine is not
-simply never get looked up, which is what makes merging every architecture into
-one file free for the machines that do not match. It is imported once at
-startup, before any device exists:
+together are 261 entries and 904 KB, against 187 and 608 KB for `0.6b-base`
+alone — so covering the whole backend costs about 300 KB more than covering one
+model of it. Entries for another runtime are simply never looked up, which is
+what makes merging every runtime into one file free for the machines that do
+not match. Within a runtime they are shared, though: an autotune namespace names
+the runtime and the device index (`device-0-0-cuda`), not the GPU model, so any
+NVIDIA card reuses the picks this file was tuned with on an RTX 3090 rather
+than tuning its own. It is imported once at startup, before any device exists:
 
 ```
-imported 288 kernel-cache entries from kernels/autotune.bundle in 6.9ms
+imported 261 kernel-cache entries from kernels/autotune.bundle in 3.5ms
   (9 namespaces, 0 already present, 0 refused)
 ```
 
