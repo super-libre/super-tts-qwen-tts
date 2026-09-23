@@ -105,12 +105,18 @@ impl CausalConv1d {
         };
         self.conv.forward(xs.pad([(self.padding, extra)], mode))
     }
+
+    /// Input steps before an output's own that the output depends on: the causal padding.
+    fn reach(&self) -> usize {
+        self.padding
+    }
 }
 
 /// ConvTranspose1d whose trailing `kernel_size - stride` samples are trimmed to keep it causal.
 #[derive(Module, Debug)]
 struct CausalConvTranspose1d {
     conv: ConvTranspose1d,
+    stride: usize,
     right_pad: usize,
 }
 
@@ -120,8 +126,17 @@ impl CausalConvTranspose1d {
             conv: ConvTranspose1dConfig::new([in_c, out_c], kernel_size)
                 .with_stride(stride)
                 .init(device),
+            stride,
             right_pad: kernel_size - stride,
         }
+    }
+
+    /// Input steps before an output's own that the output depends on: an output at `o` sums
+    /// the inputs `i` with `0 <= o - i * stride < kernel_size`, so at most `(kernel_size - 1)
+    /// / stride` before `o / stride`, which is `right_pad / stride` rounded up — one for the
+    /// vocoder's `2 * rate` kernels, none for the `kernel_size == stride` upsampling stages.
+    fn reach(&self) -> usize {
+        self.right_pad.div_ceil(self.stride)
     }
 
     fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
@@ -482,32 +497,77 @@ impl Decoder {
                 convnext: ConvNeXtBlock::init(cfg.latent_dim, device),
             })
             .collect();
-        let pre_conv = CausalConv1d::init(cfg.codebook_dim, cfg.latent_dim, 3, 1, 1, 1, device);
-        // `padding` is the causal left padding of that convolution, in frames.
-        let context_frames = cfg
-            .sliding_window
-            .map(|window| window.saturating_sub(1).saturating_add(pre_conv.padding));
-        Self {
+        let mut decoder = Self {
             quantizer: SplitResidualVectorQuantizer::init(cfg, device),
-            pre_conv,
+            pre_conv: CausalConv1d::init(cfg.codebook_dim, cfg.latent_dim, 3, 1, 1, 1, device),
             pre_transformer: PreTransformer::init(cfg, device),
             upsample,
             vocoder: Vocoder::init(cfg, device),
             num_quantizers: cfg.num_quantizers,
             total_upsample: cfg.total_upsample(),
-            context_frames,
+            context_frames: None,
+        };
+        decoder.context_frames = cfg.sliding_window.map(|window| {
+            // Back to front: the frames the convolutions after the transformer reach, every
+            // one of the transformer's stacked windows, and the causal `pre_conv` feeding it —
+            // `padding` is its left padding, in frames.
+            let after = decoder
+                .reach_after_transformer()
+                .div_ceil(decoder.total_upsample);
+            let attention = cfg.num_hidden_layers * window.saturating_sub(1);
+            after + attention + decoder.pre_conv.padding
+        });
+        decoder
+    }
+
+    /// How far back, in output samples, the stack after the transformer reaches: the
+    /// receptive field of its causal convolutions, each one's reach counted in the samples
+    /// its input steps span at the output.
+    ///
+    /// For the 12 Hz checkpoints (`upsampling_ratios` 2, 2 and `upsample_rates` 8, 5, 4, 3):
+    /// the two ConvNeXt kernels of 7 at 960 and 480 samples a step, 5760 + 2880; the
+    /// vocoder's opening kernel of 7 at 480, 2880; its four transposed convolutions, one step
+    /// each at 480, 60, 12 and 3; and in each of its blocks the dilated kernels of 7 — 6, 18
+    /// and 54 steps — at 60, 12, 3 and 1 samples a step, 4680 + 936 + 234 + 78; then the
+    /// closing kernel of 7 at 1, 6. That is 18 009 samples, 9.4 frames of 1920.
+    fn reach_after_transformer(&self) -> usize {
+        // Output samples per step at the point reached walking back from the output.
+        let mut per_step = 1;
+        let mut samples = self.vocoder.final_conv.reach();
+        for block in self.vocoder.blocks.iter().rev() {
+            for unit in block.residual_units.iter().rev() {
+                samples += (unit.conv2.reach() + unit.conv1.reach()) * per_step;
+            }
+            per_step *= block.upsample.stride;
+            samples += block.upsample.reach() * per_step;
         }
+        samples += self.vocoder.pre_conv.reach() * per_step;
+        for stage in self.upsample.iter().rev() {
+            samples += stage.convnext.dwconv.reach() * per_step;
+            per_step *= stage.conv.stride;
+            samples += stage.conv.reach() * per_step;
+        }
+        debug_assert_eq!(per_step, self.total_upsample);
+        samples
     }
 
     /// Frames of history the last frame of a decode needs behind it to come out the same as
     /// it would from a decode of the whole utterance, or `None` when no finite number does.
     ///
-    /// Everything downstream of [`PreTransformer`] is causal and runs on upsampled samples,
-    /// so it reaches back well under a frame; what sets this is the transformer itself, whose
-    /// attention is restricted to a sliding window, and the causal `pre_conv` that feeds it —
-    /// the oldest frame the window reaches needs its own left padding to be real frames and
-    /// not the zeros a slice starting there would give it. With attention over the whole
-    /// sequence instead there is no such bound, and only a decode from the start matches.
+    /// Three parts. The stack after [`PreTransformer`] is causal convolutions on upsampled
+    /// samples, and reaches back [`Self::reach_after_transformer`] of them — a handful of
+    /// frames. The transformer's attention is restricted to a sliding window, but its layers
+    /// stack: a frame attends to the window before it at every layer, and what it finds there
+    /// was itself computed from a window further back, so the output of the last layer reaches
+    /// `num_hidden_layers` windows, not one. Then the causal `pre_conv` feeding it, whose
+    /// oldest frame needs its own left padding to be real frames and not the zeros a slice
+    /// starting there would give it. With attention over the whole sequence instead there is
+    /// no such bound, and only a decode from the start matches.
+    ///
+    /// This is the exact figure, 580 frames for the 12 Hz checkpoints, and most of it buys
+    /// little: measured against a whole decode of the same codes, a chunk decoded behind 73
+    /// frames matches it to 37 dB and behind 150 to 65 dB, which is the decoder's own
+    /// arithmetic noise. A caller decoding as it goes may well carry less; that is its trade.
     pub fn context_frames(&self) -> Option<usize> {
         self.context_frames
     }
@@ -524,7 +584,12 @@ impl Decoder {
         let hidden = self.quantizer.decode(codes);
         let hidden = self.pre_conv.forward(hidden).swap_dims(1, 2);
         let hidden = self.pre_transformer.forward(hidden, state);
-        let mut hidden = hidden.swap_dims(1, 2);
+        self.after_transformer(hidden.swap_dims(1, 2))
+    }
+
+    /// The stack after the transformer: latents (B, latent_dim, T) to audio (B, 1, T *
+    /// total_upsample).
+    fn after_transformer(&self, mut hidden: Tensor<3>) -> Tensor<3> {
         for stage in self.upsample.iter() {
             hidden = stage.convnext.forward(stage.conv.forward(hidden));
         }
@@ -1299,6 +1364,92 @@ mod tests {
         assert_eq!(nearest(&[2., 2.], &entries, 2), 3);
         // A tie goes to the first entry.
         assert_eq!(nearest(&[0.5, 0.5], &entries, 2), 0);
+    }
+
+    /// The 12 Hz decoder at toy widths: the same kernels, strides and dilations, since those
+    /// are what the receptive field is made of, and the same eight windowed layers.
+    fn tiny_decoder_config() -> DecoderConfig {
+        DecoderConfig {
+            codebook_size: 8,
+            codebook_dim: 4,
+            latent_dim: 4,
+            decoder_dim: 16,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            num_hidden_layers: 8,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.,
+            max_position_embeddings: 64,
+            sliding_window: Some(72),
+            num_quantizers: 2,
+            num_semantic_quantizers: 1,
+            upsample_rates: vec![8, 5, 4, 3],
+            upsampling_ratios: vec![2, 2],
+            hidden_act: crate::qwen3::config::Activation::Silu,
+            attention_bias: false,
+        }
+    }
+
+    /// The figure this replaced was one window plus the `pre_conv`, 73: a stream decoding
+    /// behind it matched a whole decode to 37 dB, with the loss at every seam past the first.
+    #[test]
+    fn context_frames_counts_every_stacked_window_and_the_stack_after_the_transformer() {
+        let device = crate::qwen3::test_device();
+        let decoder = Decoder::init(&tiny_decoder_config(), &device);
+        // The sum worked through on `reach_after_transformer`.
+        assert_eq!(decoder.reach_after_transformer(), 18_009);
+        assert_eq!(decoder.total_upsample, 1920);
+        // Ten frames of that, eight windows of 71 frames, two of `pre_conv`.
+        assert_eq!(decoder.context_frames(), Some(10 + 8 * 71 + 2));
+
+        let mut unbounded = tiny_decoder_config();
+        unbounded.sliding_window = None;
+        assert_eq!(Decoder::init(&unbounded, &device).context_frames(), None);
+    }
+
+    /// The reach is arithmetic on kernels and strides; this checks it against the
+    /// convolutions themselves. A frame of latents is replaced and the audio compared: past the
+    /// counted reach nothing may move at all — those samples are computed from the same inputs
+    /// by the same kernels, so the comparison is exact, not a tolerance.
+    #[test]
+    fn nothing_past_the_counted_reach_depends_on_a_frame() {
+        let device = crate::qwen3::test_device();
+        let cfg = tiny_decoder_config();
+        let decoder = Decoder::init(&cfg, &device);
+        let (frames, kicked_frame) = (24, 6);
+        let latents = Tensor::<3>::random(
+            [1, cfg.latent_dim, frames],
+            burn::tensor::Distribution::Uniform(-1., 1.),
+            &device,
+        );
+        let kick = Tensor::<3>::random(
+            [1, cfg.latent_dim, 1],
+            burn::tensor::Distribution::Uniform(-1., 1.),
+            &device,
+        );
+        let kicked = latents.clone().slice_assign(
+            [0..1, 0..cfg.latent_dim, kicked_frame..kicked_frame + 1],
+            kick,
+        );
+        let samples = |latents| {
+            decoder
+                .after_transformer(latents)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+        };
+        let (before, after) = (samples(latents), samples(kicked));
+        assert_eq!(before.len(), frames * decoder.total_upsample);
+        let untouched_from =
+            (kicked_frame + 1) * decoder.total_upsample + decoder.reach_after_transformer();
+        assert_eq!(before[untouched_from..], after[untouched_from..]);
+        // And the kick did land: the frame's own samples moved.
+        let own =
+            kicked_frame * decoder.total_upsample..(kicked_frame + 1) * decoder.total_upsample;
+        assert_ne!(before[own.clone()], after[own]);
     }
 
     #[test]

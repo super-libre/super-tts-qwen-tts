@@ -157,6 +157,36 @@ const DEEP_WARM_UP_THRESHOLD: std::time::Duration = std::time::Duration::from_se
 /// below more often.
 const STREAM_CHUNK_FRAMES: usize = 25;
 
+/// Frames of already-decoded history each chunk is decoded behind, at most.
+///
+/// The decoder states how much history makes a chunk come out exactly as a
+/// decode of the whole utterance would —
+/// [`SpeechTokenizer::decode_context_frames`], 580 frames for the 12 Hz codec,
+/// since its eight windowed attention layers compound — and carrying all of it
+/// would decode 24 frames for every one heard. Most of it buys nothing
+/// audible. Measured on the 12 Hz codec against a whole decode of the same
+/// codes, the stream matches it to 37 dB behind 73 frames (one window, what
+/// this replaced) and to 65 dB behind 150, and 60 dB is where the decoder's
+/// own arithmetic noise sits: its f32 matmuls run on tensor cores at TF32,
+/// and a whole decode is 60 dB from the fp32 reference for that alone. So 150
+/// puts the seams under the noise, at 1.8x the decode work of 73; every frame
+/// past it is paid for and not heard.
+const STREAM_CONTEXT_FRAMES: usize = 150;
+
+/// A seed for one request's sampling, drawn from the process's entropy.
+///
+/// The vendored [`GenerationConfig`] defaults to one fixed seed, which is what
+/// a demo wants: the same text plays the same way twice. A service must not.
+/// Sampling decides how an utterance comes out — a draw can fade, clip or
+/// rush — and with one seed the same sentence gets the same draw every time it
+/// is spoken, with no way out but changing the words; the reference
+/// implementation draws fresh noise on every call. The seed goes in the log
+/// with the utterance, so a draw worth studying can still be repeated.
+fn fresh_seed() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one(0u64)
+}
+
 /// The `[[options]]` entry a request's sampling temperature arrives under.
 ///
 /// The name is half a contract: `server.rs` reads the header the daemon spells
@@ -1209,6 +1239,7 @@ impl QwenTts {
     ) -> Result<Outcome> {
         let mut generation = GenerationConfig {
             max_new_tokens,
+            seed: fresh_seed(),
             ..Default::default()
         };
         // Only the talker's own sampling. The code predictor draws the codec's
@@ -1278,10 +1309,11 @@ impl QwenTts {
                 ControlFlow::Continue(())
             })
             .map_err(|e| anyhow!("generating speech: {e}"))?;
-        log::debug!(
-            "generated {} frames ({:.1}s)",
+        log::info!(
+            "generated {} frames ({:.1}s) from seed {:#x}",
             frames.len(),
-            seconds_of(frames.len(), frames_per_second)
+            seconds_of(frames.len(), frames_per_second),
+            generation.seed
         );
         if stopped {
             return Ok(Outcome::Stopped);
@@ -1300,15 +1332,15 @@ impl QwenTts {
 /// Decodes codec frames to audio in fixed chunks as they are generated.
 ///
 /// Each chunk is decoded together with the frames that precede it, whose audio
-/// is then discarded, so the streamed result is sample-for-sample what a single
-/// decode of the whole utterance would have produced. How many of them that
-/// takes is the decoder's to say — see
-/// [`SpeechTokenizer::decode_context_frames`] — and not a number to pick by
-/// ear: a context short of it silently truncates the attention of every chunk
-/// past the first, which is the far end of an utterance and nowhere else.
-/// Every such decode goes through one window of [`Self::window_frames`], short
-/// chunks padded up to it, so the decoder is compiled and tuned for a single
-/// shape.
+/// is then discarded, so the seam between it and the last chunk is what a
+/// single decode of both would have produced. The decoder says how many frames
+/// make that exact — [`SpeechTokenizer::decode_context_frames`] — and it is
+/// more than a stream can afford to re-decode with every chunk, so the stream
+/// carries [`STREAM_CONTEXT_FRAMES`] of it, a figure set by measuring the seams
+/// against a whole decode rather than by ear: short of it, the loss sits at
+/// every seam past the first and nowhere else. Every decode goes through one
+/// window of [`Self::window_frames`], short chunks padded up to it, so the
+/// decoder is compiled and tuned for a single shape.
 struct ChunkDecoder<'a> {
     speech_tokenizer: &'a mut SpeechTokenizer,
     /// Every frame generated so far, flattened.
@@ -1317,13 +1349,10 @@ struct ChunkDecoder<'a> {
     num_code_groups: usize,
     /// Frames whose audio has already been handed to the caller.
     written: usize,
-    /// Frames of context each decode carries, read off the decoder;
-    /// `usize::MAX` when it attends over the whole sequence, where the `min`
-    /// in [`decode_span`] turns it into every frame generated so far.
+    /// Frames of context each decode carries, see [`stream_context_frames`].
     context_frames: usize,
     /// The one shape every decode reaches the decoder as: a full context plus a
-    /// full chunk. `None` when the context is unbounded and there is no one
-    /// shape to hold.
+    /// full chunk.
     ///
     /// A GPU backend compiles and tunes its kernels per shape, so a decoder fed
     /// the lengths a stream naturally produces — a chunk, then two, then three,
@@ -1332,24 +1361,30 @@ struct ChunkDecoder<'a> {
     /// once. The decoder is causal and
     /// [`SpeechTokenizer::decode_window`] truncates the padding's samples, so
     /// the audio is unchanged.
-    window_frames: Option<usize>,
+    window_frames: usize,
+}
+
+/// The context a stream decodes each chunk behind: what the decoder asks for,
+/// up to [`STREAM_CONTEXT_FRAMES`]. A decoder with no finite figure — attention
+/// over the whole sequence — gets the cap too: what it loses is the same
+/// distant history, and a decode from the first frame of every chunk would
+/// grow with the utterance.
+fn stream_context_frames(decoder: Option<usize>) -> usize {
+    decoder.map_or(STREAM_CONTEXT_FRAMES, |exact| {
+        exact.min(STREAM_CONTEXT_FRAMES)
+    })
 }
 
 impl<'a> ChunkDecoder<'a> {
     fn new(speech_tokenizer: &'a mut SpeechTokenizer) -> Self {
-        let context_frames = speech_tokenizer
-            .decode_context_frames()
-            .unwrap_or(usize::MAX);
+        let context_frames = stream_context_frames(speech_tokenizer.decode_context_frames());
         Self {
             speech_tokenizer,
             codes: Vec::new(),
             num_code_groups: 0,
             written: 0,
             context_frames,
-            // Only overflows for the unbounded context, which is what `None`
-            // is for: a decode that reaches back to the first frame has a
-            // different length every time and no window to be padded to.
-            window_frames: context_frames.checked_add(STREAM_CHUNK_FRAMES),
+            window_frames: context_frames + STREAM_CHUNK_FRAMES,
         }
     }
 
@@ -1381,21 +1416,15 @@ impl<'a> ChunkDecoder<'a> {
             return None;
         }
         let (context, span) = decode_span(self.written, frames, self.context_frames);
+        debug_assert!(span <= self.window_frames);
         let start = (self.written - context) * self.num_code_groups;
         let codes = &self.codes[start..frames * self.num_code_groups];
-        let samples_per_frame = self.speech_tokenizer.samples_per_frame();
         // `decode_window` drops the context's audio itself: it was decoded only
         // so the seam between this chunk and the last one matches a single
-        // decode. Without a window there is nothing to pad to, so the decode is
-        // the prefix at its own length and the context is dropped here.
-        let pcm = if let Some(window) = self.window_frames {
-            debug_assert!(span <= window);
-            self.speech_tokenizer.decode_window(codes, context, window)
-        } else {
-            let mut pcm = self.speech_tokenizer.decode_chunk(codes);
-            pcm.drain(..context * samples_per_frame);
-            pcm
-        };
+        // decode.
+        let pcm = self
+            .speech_tokenizer
+            .decode_window(codes, context, self.window_frames);
         self.written = frames;
         Some(pcm)
     }
@@ -1547,7 +1576,7 @@ mod tests {
     /// want.
     #[test]
     fn no_decode_of_a_stream_outgrows_the_window() {
-        for context_frames in [0, 1, STREAM_CHUNK_FRAMES, 73, 200] {
+        for context_frames in [0, 1, STREAM_CHUNK_FRAMES, 73, STREAM_CONTEXT_FRAMES, 580] {
             let window = context_frames + STREAM_CHUNK_FRAMES;
             for total in 1..=4 * window {
                 let mut written = 0;
@@ -1567,25 +1596,149 @@ mod tests {
         }
     }
 
-    /// The context a chunked decode carries is the decoder's to state, and the
-    /// bug this replaced was a hand-picked 50 against a decoder that wanted 73:
-    /// every chunk past the first lost the older end of its attention window,
-    /// which is audible from the point the first truncated chunk starts and
-    /// never recovers. A decode that asks for no context at all still has to
-    /// come out well-formed, since that is the first chunk of every utterance.
+    /// A decode that asks for no context at all still has to come out
+    /// well-formed, since that is the first chunk of every utterance; once
+    /// there is history, all of it is carried until the context is full, and
+    /// exactly that much afterwards.
     #[test]
-    fn a_decode_carries_the_context_the_decoder_asks_for() {
-        // The first chunk has nothing behind it, whatever the decoder wants.
+    fn a_decode_carries_the_context_it_is_given() {
         assert_eq!(
-            decode_span(0, STREAM_CHUNK_FRAMES, 73),
+            decode_span(0, STREAM_CHUNK_FRAMES, 150),
             (0, STREAM_CHUNK_FRAMES)
         );
-        // Once there is history, all of it is carried until the decoder is
-        // satisfied, and exactly that much afterwards.
-        assert_eq!(decode_span(25, 50, 73), (25, 50));
-        assert_eq!(decode_span(50, 75, 73), (50, 75));
-        assert_eq!(decode_span(75, 100, 73), (73, 98));
-        assert_eq!(decode_span(200, 225, 73), (73, 98));
+        assert_eq!(decode_span(25, 50, 150), (25, 50));
+        assert_eq!(decode_span(150, 175, 150), (150, 175));
+        assert_eq!(decode_span(175, 200, 150), (150, 175));
+        assert_eq!(decode_span(400, 425, 150), (150, 175));
+    }
+
+    /// Two figures this replaced, each wrong the same way: a hand-picked 50,
+    /// then the decoder's own 73, which counted one attention window where its
+    /// eight compound. Both left every chunk past the first without most of
+    /// its history, a loss that starts at the first seam and never recovers.
+    /// The decoder now states the exact figure and the stream carries what it
+    /// asks for, up to the measured budget.
+    #[test]
+    fn the_stream_carries_the_decoders_context_up_to_the_budget() {
+        assert_eq!(stream_context_frames(Some(73)), 73);
+        assert_eq!(stream_context_frames(Some(150)), 150);
+        assert_eq!(stream_context_frames(Some(580)), 150);
+        assert_eq!(stream_context_frames(None), 150);
+    }
+
+    /// One text asked for twice is two draws, as it is from the reference; the
+    /// vendored default would make it one.
+    #[test]
+    fn every_request_draws_its_own_seed() {
+        let seeds: std::collections::HashSet<u64> = (0..16).map(|_| fresh_seed()).collect();
+        assert_eq!(seeds.len(), 16);
+        assert!(!seeds.contains(&GenerationConfig::default().seed));
+    }
+
+    /// The check that matters, on real weights: every chunk the stream hands
+    /// out, one frame pushed at a time through [`ChunkDecoder`], against one
+    /// decode of the whole utterance. Needs a checkpoint, a GPU and a file of
+    /// codes, so it runs by hand:
+    ///
+    /// ```sh
+    /// QWEN_TTS_CODEC=$HOME/.local/share/super-tts/backends/app.super-tts.qwen-tts/models/qwen3-tts-1.7b-base/speech_tokenizer \
+    /// QWEN_TTS_CODES=/path/to/codes.bin \
+    /// cargo test --release --no-default-features --features cuda -- --ignored --nocapture a_streamed_decode
+    /// ```
+    ///
+    /// `codes.bin` is what the talker generates, frame-major little-endian
+    /// `u32`, `num_code_groups` to a frame. Measured 2026-09-21 on 239 frames
+    /// of the 1.7B base checkpoint: 65 dB behind [`STREAM_CONTEXT_FRAMES`],
+    /// 37 dB behind the 73 it replaced.
+    #[test]
+    #[ignore = "needs a checkpoint, a GPU and a file of codes; see the doc comment"]
+    fn a_streamed_decode_matches_a_whole_decode() {
+        let (Ok(codec_dir), Ok(codes_file)) = (
+            std::env::var("QWEN_TTS_CODEC"),
+            std::env::var("QWEN_TTS_CODES"),
+        ) else {
+            eprintln!("QWEN_TTS_CODEC and QWEN_TTS_CODES are not set; nothing to check");
+            return;
+        };
+        let codec_dir = std::path::PathBuf::from(codec_dir);
+        let cfg: SpeechTokenizerConfig =
+            serde_json::from_slice(&std::fs::read(codec_dir.join("config.json")).unwrap()).unwrap();
+        let device = crate::qwen3::test_device();
+        let mut speech_tokenizer =
+            SpeechTokenizer::load(&cfg, &codec_dir.join("model.safetensors"), &device).unwrap();
+        let codes: Vec<u32> = std::fs::read(codes_file)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&bytes| u32::from_le_bytes(bytes))
+            .collect();
+        let groups = speech_tokenizer.num_code_groups();
+        let frames = codes.len() / groups;
+
+        let whole = speech_tokenizer.decode_chunk(&codes);
+        let mut decoder = ChunkDecoder::new(&mut speech_tokenizer);
+        eprintln!(
+            "{frames} frames, {} of context a chunk, window of {}",
+            decoder.context_frames, decoder.window_frames
+        );
+        let mut streamed = Vec::with_capacity(whole.len());
+        let mut timings = Vec::new();
+        for frame in codes.chunks_exact(groups) {
+            let started = std::time::Instant::now();
+            if let Some(pcm) = decoder.push(frame) {
+                timings.push(started.elapsed());
+                streamed.extend(pcm);
+            }
+        }
+        if let Some(pcm) = decoder.flush() {
+            streamed.extend(pcm);
+        }
+        assert_eq!(streamed.len(), whole.len());
+
+        let signal: f64 = whole.iter().map(|&x| f64::from(x).powi(2)).sum();
+        let noise: f64 = whole
+            .iter()
+            .zip(&streamed)
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum();
+        let snr = 10. * (signal / noise.max(1e-300)).log10();
+        // The first decode carries the shape's kernel tuning; the rest are the cost.
+        let steady = &timings[1..];
+        let mean =
+            steady.iter().sum::<std::time::Duration>() / u32::try_from(steady.len()).unwrap();
+        eprintln!(
+            "streamed vs whole: {snr:.1} dB; {} chunk decodes, {:.0} ms each after the first ({:.0} ms)",
+            timings.len(),
+            mean.as_secs_f64() * 1e3,
+            timings[0].as_secs_f64() * 1e3
+        );
+        assert!(
+            snr >= 60.,
+            "the stream is {snr:.1} dB from a whole decode; 60 is the decoder's own noise"
+        );
+
+        // What the window costs against the 98-frame one this replaced, warm.
+        let mut time = |window: usize| {
+            let context = window - STREAM_CHUNK_FRAMES;
+            let prefix = &codes[..window * groups];
+            speech_tokenizer.decode_window(prefix, context, window);
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                speech_tokenizer.decode_window(prefix, context, window);
+            }
+            started.elapsed() / 5
+        };
+        for window in [
+            73 + STREAM_CHUNK_FRAMES,
+            STREAM_CONTEXT_FRAMES + STREAM_CHUNK_FRAMES,
+        ] {
+            let took = time(window);
+            eprintln!(
+                "window of {window} frames: {:.0} ms a decode, warm",
+                took.as_secs_f64() * 1e3
+            );
+        }
     }
 
     /// The range in this file and the `min`/`max` in the manifest are one

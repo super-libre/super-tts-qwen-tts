@@ -15,7 +15,7 @@
 //!
 //! Vendored from the `qwen3-tts` example of
 //! <https://github.com/jorge-menjivar/burn>, branch `qwen3-tts`, commit
-//! `9cd83cc49`. The only edits are mechanical: `crate::` became
+//! `9cd83cc49`. The edits are mechanical, but for the one noted below: `crate::` became
 //! `crate::qwen3::` because these modules are a module of the backend rather
 //! than a crate of their own, and the example's `audio` module (a wav reader
 //! and writer with a resampler) is left behind — this backend reads no file and
@@ -33,6 +33,14 @@
 //!
 //! `Cargo.toml` pins Burn at that same commit, so these modules and the crates
 //! they compile against come from one revision of one branch.
+//!
+//! One edit is deliberate and waits to be carried back to the fork:
+//! `Decoder::context_frames` in [`speech_tokenizer`] counted one attention
+//! window where the decoder's stacked layers compound, and nothing for the
+//! convolutions after the transformer, so a stream decoded behind it lost most
+//! of its history at every seam. It now counts both, with the receptive-field
+//! arithmetic and its tests beside it. Until the fork has it, the diff above
+//! shows that hunk.
 //!
 //! It is vendored rather than depended on because the example crate is a
 //! demo: it also pulls `clap`, `hf-hub` and `tokenizers/onig`, and cargo
