@@ -146,12 +146,20 @@ jobs:
       # images, and macOS builds with cargo directly. No GPU is needed at build
       # time and no compute capability is chosen: CubeCL compiles the kernels
       # on the host that runs them.
+      #
+      # cross runs the container as the runner's uid, which has no passwd
+      # entry there, so `HOME` is `/` and nothing under it is writable. The
+      # ROCm build needs it to be: `cubecl-hip` compiles through a prebuilt
+      # LLVM that `tracel-llvm-bundler`'s build script downloads to
+      # `~/.cache/tracel` and unpacks to `~/.local/share/tracel`, then links
+      # statically. `/tmp` is the container's own and dies with it.
       - name: Build
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
             build=cargo
           else
             build=cross
+            export CROSS_CONTAINER_OPTS="-e HOME=/tmp/home"
             if [ -n "${{ matrix.image }}" ]; then
               export CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE="${{ matrix.image }}"
             fi
