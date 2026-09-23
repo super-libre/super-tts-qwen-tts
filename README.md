@@ -1,9 +1,9 @@
 # Super TTS — Qwen TTS backend
 
-[![coverage](https://img.shields.io/endpoint?url=https://jorge-menjivar.github.io/super-tts-qwen-tts/coverage.json)](https://jorge-menjivar.github.io/super-tts-qwen-tts/)
+[![coverage](https://img.shields.io/endpoint?url=https://super-libre.github.io/super-tts-qwen-tts/coverage.json)](https://super-libre.github.io/super-tts-qwen-tts/)
 
 Qwen's text-to-speech models as a subprocess backend for
-[Super TTS](https://github.com/jorge-menjivar/super-tts). Ten languages, 24 kHz
+[Super TTS](https://github.com/super-libre/super-tts). Ten languages, 24 kHz
 output, nine preset voices — or no preset voice at all, and a voice written out
 in words instead.
 
@@ -354,7 +354,7 @@ binary rather than a tool beside it.
 ### Building
 
 ```sh
-git clone https://github.com/jorge-menjivar/super-tts-qwen-tts
+git clone https://github.com/super-libre/super-tts-qwen-tts
 just build-release          # the pure-Rust CPU backend
 just build-cuda             # needs the CUDA headers — no GPU, no compute capability
 just build-rocm             # needs the ROCm headers
