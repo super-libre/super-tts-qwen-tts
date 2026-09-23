@@ -27,14 +27,19 @@ jobs:
           # carries exactly one backend rather than its own plus the default
           # `flex`.
           #
-          # Linux builds go through cross on an Ubuntu runner, inside `image`
-          # when one is named. macOS builds run natively on a macOS runner:
-          # cross has no Apple SDK to offer.
+          # Every Linux build links against Ubuntu 22.04's glibc, 2.35, so
+          # every asset starts on the same hosts. A build with an `image` runs
+          # through cross inside it; the rest build natively on a 22.04 runner.
+          # cross's own default images are not an option: since May 2026 they
+          # are Ubuntu 24.04, and std's weak reference to `pidfd_spawnp` picks
+          # up that glibc's version, so a binary that spawns a process at all
+          # demands 2.39 and will not start on 22.04 or Debian 12. macOS
+          # builds natively too: cross has no Apple SDK to offer.
 
           # CPU (x86_64) — the pure-Rust backend, which runs anywhere. Usable,
           # but the talker is a transformer: expect slower than real time.
           - {
-              os: ubuntu-latest,
+              os: ubuntu-22.04,
               target: x86_64-unknown-linux-gnu,
               suffix: cpu,
               features: flex,
@@ -81,17 +86,18 @@ jobs:
 
           # Vulkan: no SDK needed to build, the loader is found at runtime.
           - {
-              os: ubuntu-latest,
+              os: ubuntu-22.04,
               target: x86_64-unknown-linux-gnu,
               suffix: vulkan,
               features: vulkan,
               image: "",
             }
 
-          # CPU (aarch64) — cross-compiled. No CUDA or ROCm on ARM here, and
-          # Vulkan is left out until there is a runner to test it on.
+          # CPU (aarch64), built natively on an arm64 runner. No CUDA or ROCm
+          # on ARM here, and Vulkan is left out until there is a runner to test
+          # it on.
           - {
-              os: ubuntu-latest,
+              os: ubuntu-22.04-arm,
               target: aarch64-unknown-linux-gnu,
               suffix: cpu,
               features: flex,
@@ -134,18 +140,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-${{ matrix.suffix }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.os }}-${{ matrix.target }}-${{ matrix.suffix }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cross
-        if: runner.os == 'Linux'
+        if: matrix.image != ''
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       # The CUDA and ROCm builds run inside their vendor's devel image, which
       # carries the toolkit those backends bind against, selected per-target
-      # via cross's image override. The other Linux builds use cross's default
-      # images, and macOS builds with cargo directly. No GPU is needed at build
-      # time and no compute capability is chosen: CubeCL compiles the kernels
-      # on the host that runs them.
+      # via cross's image override. Everything else builds with cargo on the
+      # runner itself. No GPU is needed at build time and no compute
+      # capability is chosen: CubeCL compiles the kernels on the host that
+      # runs them.
       #
       # cross runs the container as the runner's uid, which has no passwd
       # entry there, so `HOME` is `/` and nothing under it is writable. The
@@ -155,14 +161,12 @@ jobs:
       # statically. `/tmp` is the container's own and dies with it.
       - name: Build
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            build=cargo
-          else
+          if [ -n "${{ matrix.image }}" ]; then
             build=cross
+            export CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE="${{ matrix.image }}"
             export CROSS_CONTAINER_OPTS="-e HOME=/tmp/home"
-            if [ -n "${{ matrix.image }}" ]; then
-              export CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE="${{ matrix.image }}"
-            fi
+          else
+            build=cargo
           fi
           "$build" build --release --locked --target ${{ matrix.target }} \
             --no-default-features --features "${{ matrix.features }}" \
