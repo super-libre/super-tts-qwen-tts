@@ -187,11 +187,14 @@ first audio 0.3 seconds into a request and synthesizes at about 6x real time —
 19 seconds of speech in 3.2. On a CPU it is slower than real time; the 0.6B
 model is the one to try without a GPU.
 
-Releases ship eight builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
-12 and CUDA 13, ROCm, and Vulkan. On Apple Silicon Macs: a CPU build and Metal.
-The daemon picks the one matching the machine, and ranks a native backend above
-Vulkan above the CPU. There is no
-compute-capability axis — see the manifest for why.
+Releases ship seven builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
+12 and CUDA 13, and ROCm. On Apple Silicon Macs: a CPU build and Metal. The
+daemon picks the one matching the machine, and ranks a GPU backend above the
+CPU. There is no compute-capability axis — see the manifest for why.
+
+Vulkan builds but is not released: on NVIDIA's 610.57.04 driver every load
+segfaults inside the driver's SPIR-V compiler on a bf16 reduce kernel, so the
+kernel bundle has no Vulkan entries either.
 
 Weights are downloaded by the daemon before the first load. This process has no
 network at all — it runs with `PrivateNetwork=yes` and a read-only backend
