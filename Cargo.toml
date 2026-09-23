@@ -31,7 +31,12 @@
     # The model in `src/qwen3` is Burn's, vendored from this fork's `qwen3-tts`
     # example (see that module's provenance note). Burn is pinned by revision:
     # the model needs six fixes to Burn's fusion crates that are not upstream
-    # yet, and `burn` has no stability guarantee between revisions anyway.
+    # yet, and `burn` has no stability guarantee between revisions anyway. Two
+    # more ride on this revision: `into_data` reads the device when it is
+    # called, where a fused in-place op on the tensor's next use could
+    # overwrite the bytes before a lazy read, and `memory_cleanup` under fusion
+    # drains the calling stream first, where it freed nothing dropped since the
+    # last sync.
     #
     # Burn is what buys this backend ROCm and Vulkan, which candle cannot
     # reach at all — CubeCL compiles every kernel at runtime for whatever
@@ -39,26 +44,26 @@
     # generation instead of one per CUDA compute capability.
     burn = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["default", "cubecl", "extension"]
     }
     burn-cubecl = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["default"]
     }
     burn-fusion = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["default"]
     }
     burn-ir = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e"
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989"
     }
     burn-store = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["std", "safetensors"]
     }
     # Same revision Burn pins, so one CubeCL is built rather than two.
@@ -115,13 +120,14 @@
 # own manifest does not reach a build that merely depends on Burn — patches
 # come from the root of the crate being built — so this backend has to repeat
 # it, or it would build a different CubeCL than the branch was measured on.
-# Three commits ride on it: compiled kernels kept across runs by default, the
+# Four commits ride on it: compiled kernels kept across runs by default, the
 # sliced memory pool coalescing its free slices lazily rather than on every
-# free, and the channel server taking a partial batch when its producer pauses
-# — which is every frame of a stream.
+# free, the channel server taking a partial batch when its producer pauses
+# — which is every frame of a stream — and a CPU-backend read returning a copy
+# rather than a live view.
 [patch."https://github.com/tracel-ai/cubecl"]
-    cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
+    cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
