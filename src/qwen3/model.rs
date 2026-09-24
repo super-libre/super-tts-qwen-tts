@@ -739,17 +739,20 @@ impl Qwen3Tts {
         let num_passes = code_predictor.lm_head.len();
         // Two tokens in the first pass, then one per pass.
         let capacity = num_passes + 1;
-        let state = Rc::new(RefCell::new(TransformerState::new_fixed(
-            &self
-                .config
-                .talker_config
-                .code_predictor_config
-                .transformer_config(),
-            1,
-            capacity,
-            self.dtype,
-            &self.device,
-        )));
+        let state = Rc::new(RefCell::new(
+            TransformerState::new_fixed(
+                &self
+                    .config
+                    .talker_config
+                    .code_predictor_config
+                    .transformer_config(),
+                1,
+                capacity,
+                self.dtype,
+                &self.device,
+            )
+            .for_capture(),
+        ));
         let passes = (0..num_passes)
             .map(|pass| {
                 let state = state.clone();
