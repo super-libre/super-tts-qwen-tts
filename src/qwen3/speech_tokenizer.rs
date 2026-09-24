@@ -10,13 +10,17 @@
 //! vector quantizer. It is only needed to compute the codes of a reference recording for voice
 //! cloning, see [`SpeechTokenizer::encode`].
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use burn::module::Param;
 use burn::nn::conv::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear};
 use burn::prelude::*;
+use burn::tensor::DType;
 use burn::tensor::activation::{elu, gelu};
 use burn::tensor::ops::PadMode;
-use burn_store::{KeyRemapper, ModuleSnapshot, SafetensorsStore};
+use burn_store::{KeyRemapper, ModuleAdapter, ModuleSnapshot, SafetensorsStore};
 
 use crate::qwen3::config::{DecoderConfig, EncoderConfig, SpeechTokenizerConfig};
 use crate::qwen3::transformer::{
@@ -103,7 +107,25 @@ impl CausalConv1d {
         } else {
             PadMode::Constant(0.)
         };
-        self.conv.forward(xs.pad([(self.padding, extra)], mode))
+        let xs = xs.pad([(self.padding, extra)], mode);
+        // The weights say what the convolution runs in, see `store_in`; the rest of the
+        // decoder stays in f32.
+        let dtype = self.conv.weight.dtype();
+        if dtype == xs.dtype() {
+            self.conv.forward(xs)
+        } else {
+            self.conv.forward(xs.cast(dtype)).cast(DType::F32)
+        }
+    }
+
+    /// Keeps the weights in `dtype`, which makes [`forward`](Self::forward) convolve in it.
+    fn store_in(&mut self, dtype: DType) {
+        self.conv.weight = self.conv.weight.clone().map(|weight| weight.cast(dtype));
+        self.conv.bias = self
+            .conv
+            .bias
+            .take()
+            .map(|bias| bias.map(|bias| bias.cast(dtype)));
     }
 
     /// Input steps before an output's own that the output depends on: the causal padding.
@@ -570,6 +592,24 @@ impl Decoder {
     /// arithmetic noise. A caller decoding as it goes may well carry less; that is its trade.
     pub fn context_frames(&self) -> Option<usize> {
         self.context_frames
+    }
+
+    /// Runs every convolution of the decoder in `dtype`, see
+    /// [`SpeechTokenizer::convolve_in`].
+    fn convolve_in(&mut self, dtype: DType) {
+        self.pre_conv.store_in(dtype);
+        for stage in self.upsample.iter_mut() {
+            stage.convnext.dwconv.store_in(dtype);
+        }
+        let vocoder = &mut self.vocoder;
+        vocoder.pre_conv.store_in(dtype);
+        for block in vocoder.blocks.iter_mut() {
+            for unit in block.residual_units.iter_mut() {
+                unit.conv1.store_in(dtype);
+                unit.conv2.store_in(dtype);
+            }
+        }
+        vocoder.final_conv.store_in(dtype);
     }
 
     /// Decodes a chunk of codes with shape (B, num_quantizers, T) into audio
@@ -1069,14 +1109,30 @@ pub struct SpeechTokenizer {
 }
 
 impl SpeechTokenizer {
-    /// Loads the decoder from a `speech_tokenizer/model.safetensors` file. The codec always
-    /// runs in f32, as in the reference implementation.
+    /// Loads the decoder from a `speech_tokenizer/model.safetensors` file. The codec runs in
+    /// f32, as in the reference implementation, unless told otherwise with
+    /// [`convolve_in`](Self::convolve_in). `read` counts the file's bytes as they are read.
     pub fn load(
         cfg: &SpeechTokenizerConfig,
         weights: &std::path::Path,
         device: &Device,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        Self::load_with(cfg, weights, device, false)
+        Self::load_with(cfg, weights, device, false, read)
+    }
+
+    /// Runs the decoder's convolutions in `dtype`: their weights are kept in it, and their
+    /// inputs are cast to it and their outputs back to f32, around which the decoder stays.
+    ///
+    /// For Vulkan, in f16. A device there computes f32 convolutions without its matrix
+    /// units, which take half-width inputs only: on an RTX 3090 the vocoder's kernels of 7
+    /// ran at about 60 GFLOPS, 2.9 s for a streamed window of 175 frames, the 2 s of audio
+    /// it adds included, so a stream fell behind real time. In f16 the window takes 0.1 s.
+    /// f16 has the 10-bit mantissa of the TF32 CUDA runs these convolutions at, and against
+    /// f32 convolutions, 26 windows of that decode came out 52 to 65 dB apart, around 60,
+    /// where the decoder's own noise is 65.
+    pub fn convolve_in(&mut self, dtype: DType) {
+        self.model.decoder.convolve_in(dtype);
     }
 
     /// Loads the encoder as well as the decoder, for [`encode`](Self::encode).
@@ -1084,8 +1140,9 @@ impl SpeechTokenizer {
         cfg: &SpeechTokenizerConfig,
         weights: &std::path::Path,
         device: &Device,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        Self::load_with(cfg, weights, device, true)
+        Self::load_with(cfg, weights, device, true, read)
     }
 
     fn load_with(
@@ -1093,6 +1150,7 @@ impl SpeechTokenizer {
         weights: &std::path::Path,
         device: &Device,
         with_encoder: bool,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let decoder_cfg = &cfg.decoder_config;
         let encoder = with_encoder
@@ -1103,7 +1161,9 @@ impl SpeechTokenizer {
             encoder,
         };
         let mut store = SafetensorsStore::from_file(weights)
-            .with_from_adapter(crate::qwen3::CheckpointAdapter)
+            .with_from_adapter(
+                crate::qwen3::ReadCounter(Arc::clone(read)).chain(crate::qwen3::CheckpointAdapter),
+            )
             .remap(remapper(cfg)?)
             .allow_partial(true);
         let result = model

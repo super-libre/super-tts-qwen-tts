@@ -260,6 +260,8 @@ pub struct TransformerState {
     /// `0..capacity`, for a fixed cache: what a token's position is compared with to mask the
     /// cache positions after it.
     positions: Option<Tensor<1, Int>>,
+    /// Whether the passes over this state are captured, see [`Self::for_capture`].
+    captured: bool,
     sliding_window: Option<usize>,
     dtype: DType,
     device: Device,
@@ -277,6 +279,7 @@ impl TransformerState {
             ),
             caches: vec![KvCache::Growing(None); cfg.num_hidden_layers],
             positions: None,
+            captured: false,
             sliding_window: cfg.sliding_window,
             dtype,
             device: device.clone(),
@@ -304,6 +307,15 @@ impl TransformerState {
             .collect();
         state.positions = Some(Tensor::arange(0..capacity as i64, device));
         state
+    }
+
+    /// Marks a fixed state as one whose passes of several tokens are captured, which makes
+    /// them mask causally without the upload a capture on wgpu cannot hold, see
+    /// [`Self::attention_mask`].
+    pub fn for_capture(mut self) -> Self {
+        assert!(self.positions.is_some(), "only a fixed state is captured");
+        self.captured = true;
+        self
     }
 
     /// The number of positions of the fixed caches.
@@ -369,9 +381,34 @@ impl TransformerState {
     ///
     /// The reference implementation lets a query attend to the keys `j` such that
     /// `i - j < w`, i.e. the window covers `w` keys including the query itself.
+    ///
+    /// Without a sliding window the causal flag of the attention op is all that is needed,
+    /// except in a captured pass, see [`Self::for_capture`]. Where the attention op runs its
+    /// fallback, as it does on wgpu, the flag has it build the mask out of two `arange`s
+    /// uploaded from the host, and a wgpu capture records dispatches only: the upload fails
+    /// the capture. A fixed cache holds its positions on the device already, so the mask is
+    /// built from them there instead. A single query needs none, which keeps it on
+    /// [`Attention::decode`].
     fn attention_mask(&self, seq_len: usize, offset: usize) -> Option<Tensor<4, Bool>> {
-        // Without a sliding window the causal flag of the attention op is all that is needed.
-        let window = self.sliding_window?.saturating_sub(1);
+        let Some(window) = self.sliding_window else {
+            if !self.captured || seq_len == 1 {
+                return None;
+            }
+            let positions = self.positions.as_ref()?;
+            let kv_len = offset + seq_len;
+            let queries = positions
+                .clone()
+                .narrow(0, offset, seq_len)
+                .reshape([seq_len, 1])
+                .expand([seq_len, kv_len]);
+            let keys = positions
+                .clone()
+                .narrow(0, 0, kv_len)
+                .reshape([1, kv_len])
+                .expand([seq_len, kv_len]);
+            return Some(keys.greater(queries).reshape([1, 1, seq_len, kv_len]));
+        };
+        let window = window.saturating_sub(1);
         let kv_len = offset + seq_len;
         let mask: Vec<bool> = (0..seq_len)
             .flat_map(|i| {

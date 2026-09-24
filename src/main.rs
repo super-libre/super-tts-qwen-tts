@@ -24,13 +24,14 @@ mod lang;
 mod manifest_probe;
 mod model;
 mod model_thread;
+mod progress;
 mod prompt;
 mod qwen3;
 mod server;
 mod voice_cache;
 mod voices;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -46,71 +47,16 @@ const ENV_DIR: &str = "SUPER_TTS_BACKEND_DIR";
 /// goes. Absent when an older daemon spawned this backend.
 const ENV_CACHE_DIR: &str = "SUPER_TTS_BACKEND_CACHE_DIR";
 
-/// The argument that runs the exporter instead of the server.
-const EXPORT_KERNELS: &str = "export-kernels";
-
-/// Produce the kernel bundle a release ships, then exit.
-///
-/// The daemon never passes arguments, so this mode is unreachable from a
-/// running install: it is a developer tool, kept in this binary rather than a
-/// second one because a bundle is only valid for the exact `CubeCL` the
-/// consuming binary links, and two binaries are two chances to drift.
-///
-/// ```text
-/// export-kernels [--warm <model>] <out.bundle> ["Bundle name"]
-/// ```
-///
-/// `--warm` loads the model first, which fills the cache by running the same
-/// ladder a real first request does. That is how a release bundle is made:
-/// point `SUPER_TTS_BACKEND_CACHE_DIR` at an empty directory so what comes out
-/// is this model's cold load and nothing else.
-///
-/// Without it the cache is exported as it stands, which is for the machine
-/// that has already been running the backend and wants to package what it
-/// learned. Whatever else that cache accumulated ships too.
-///
-/// The bundle is only ever good for the GPU it was made on — declare it in
-/// `backend.toml` under the `cuda_sm` (or `gfx`) this machine reports.
-fn export_kernels(backend_dir: &Path, args: &[String]) -> Result<()> {
-    const USAGE: &str = "usage: export-kernels [--warm <model>] <out.bundle> [name]";
-
-    let everything = args.iter().any(|a| a == "--everything");
-    let args: Vec<String> = args
-        .iter()
-        .filter(|a| *a != "--everything")
-        .cloned()
-        .collect();
-    let (warm, rest) = match args.first().map(String::as_str) {
-        Some("--warm") => (Some(args.get(1).context(USAGE)?.clone()), &args[2..]),
-        _ => (None, args.as_slice()),
-    };
-    let out = PathBuf::from(rest.first().context(USAGE)?);
-    // The name is what a person reads in the manifest of a bundle they are
-    // about to install, so it should say which machine it came from.
-    let name = rest
-        .get(1)
-        .cloned()
-        .or_else(|| warm.clone())
-        .unwrap_or_else(|| "super-tts-qwen-tts".to_string());
-
-    if let Some(model_name) = &warm {
-        log::info!(
-            "warming {model_name} to export its kernels; against an empty cache this is a cold load and takes minutes"
-        );
-        let model = model::QwenTts::load(backend_dir, model_name, None)?;
-        let device = model.device_name().to_string();
-        // Dropped before the export so nothing is still writing to the cache.
-        drop(model);
-        log::info!("exporting the kernels {model_name} compiled on {device}");
-    } else {
-        log::info!("exporting the kernel cache as it stands, without loading a model");
-    }
-    model::export_kernel_bundle(&out, &name, everything)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // CubeCL's ROCm compiler, pliron, logs its whole IR after every pass at
+    // `info`, which is the level the daemon runs backends at: one cold load
+    // wrote a 10 GB log in about seven minutes on an AMD card. `RUST_LOG`
+    // still turns it back on, as `pliron=info`.
+    env_logger::Builder::new()
+        .filter_module("pliron", log::LevelFilter::Warn)
+        .parse_env(env_logger::Env::default().default_filter_or("info"))
+        .init();
 
     // Before anything else touches a device: the GPU kernels are compiled at
     // runtime and the configuration that says where to keep them is frozen the
@@ -126,19 +72,6 @@ async fn main() -> Result<()> {
 
     let backend_dir =
         PathBuf::from(std::env::var(ENV_DIR).with_context(|| format!("{ENV_DIR} is not set"))?);
-
-    // Straight after the cache is pointed somewhere and before any device
-    // exists. Not per model: nothing in the cache is keyed by one, so the whole
-    // build shares a single bundle and it is imported once here rather than on
-    // every load.
-    model::import_kernel_bundle(&backend_dir);
-
-    // The exporter needs the backend directory and the cache, and nothing else
-    // — no socket, no server. Checked here so both are already configured.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == EXPORT_KERNELS) {
-        return export_kernels(&backend_dir, &args[1..]);
-    }
 
     let socket_path = PathBuf::from(
         std::env::var(ENV_SOCKET).with_context(|| format!("{ENV_SOCKET} is not set"))?,

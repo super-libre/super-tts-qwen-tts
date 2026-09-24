@@ -48,8 +48,7 @@ impl Sampling {
             feature = "rocm",
             feature = "metal",
             feature = "vulkan",
-            feature = "wgpu",
-            feature = "cpu"
+            feature = "wgpu"
         ))]
         if KERNEL.load(Ordering::Relaxed)
             && crate::qwen3::sampling_kernel::available(&logits.device())
@@ -215,8 +214,7 @@ mod tests {
         feature = "rocm",
         feature = "metal",
         feature = "vulkan",
-        feature = "wgpu",
-        feature = "cpu"
+        feature = "wgpu"
     ))]
     #[test]
     fn kernel_matches_operations() {

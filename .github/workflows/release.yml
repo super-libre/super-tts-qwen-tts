@@ -14,7 +14,7 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.target }} ${{ matrix.suffix }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,58 +23,76 @@ jobs:
           # runtime, so there is no compute-capability axis: what used to be
           # twelve CUDA builds is two, one per CUDA major version.
           #
-          # `features` is passed with `--no-default-features`, so each build
-          # carries exactly one backend rather than its own plus the default
-          # `flex`.
+          # Every build is a GPU build: the models are too big for a CPU to run
+          # at a useful speed. `features` is passed with `--no-default-features`,
+          # so each build carries exactly one backend rather than its own plus
+          # the default `vulkan`.
+          #
+          # Every Linux build links against Ubuntu 22.04's glibc, 2.35, so
+          # every asset starts on the same hosts. A build with an `image` runs
+          # through cross inside it; the rest build natively on a 22.04 runner.
+          # cross's own default images are not an option: since May 2026 they
+          # are Ubuntu 24.04, and std's weak reference to `pidfd_spawnp` picks
+          # up that glibc's version, so a binary that spawns a process at all
+          # demands 2.39 and will not start on 22.04 or Debian 12. macOS
+          # builds natively too: cross has no Apple SDK to offer.
 
-          # CPU (x86_64) — the pure-Rust backend, which runs anywhere. Usable,
-          # but the talker is a transformer: expect slower than real time.
+          # CUDA. Built inside the nvidia/cuda devel image via cross's image
+          # override: `cudarc` asks `nvcc --version` which CUDA API to bind, so
+          # the image's toolkit is what decides `cuda_major`. The plain `devel`
+          # tag, not `cudnn-devel`: Burn never calls cuDNN, and its layers are
+          # gigabytes of a runner's disk for nothing.
           - {
-              target: x86_64-unknown-linux-gnu,
-              suffix: cpu,
-              features: flex,
-              image: "",
-            }
-
-          # CUDA. Built inside the nvidia/cuda devel image (carries nvcc and
-          # the headers `cubecl-hip-sys`'s CUDA counterpart reads the version
-          # from) via cross's image override.
-          - {
+              os: ubuntu-latest,
               target: x86_64-unknown-linux-gnu,
               suffix: cuda12,
               features: cuda,
-              image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04",
+              image: "nvidia/cuda:12.9.1-devel-ubuntu22.04",
             }
           - {
+              os: ubuntu-latest,
               target: x86_64-unknown-linux-gnu,
               suffix: cuda13,
               features: cuda,
-              image: "nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04",
+              image: "nvidia/cuda:13.0.3-devel-ubuntu22.04",
             }
 
-          # ROCm. The image has to carry the ROCm version `cubecl-hip-sys`
-          # binds — 7.1 as pinned today — so this tag moves with that crate.
+          # ROCm. The image has to carry a ROCm whose HIP version
+          # `cubecl-hip-sys` has bindings for: it reads the version from
+          # `hipconfig` and links the libraries it finds, so this tag moves
+          # with that crate. 7.1.1 is HIP 52802; 7.1.0 reports a patch number
+          # the crate has no bindings for.
+          #
+          # Ubuntu 22.04 rather than 24.04, like the CUDA images: the binary
+          # needs the glibc of the image it was linked in, and one linked
+          # against 24.04's 2.39 would not start on the 22.04 hosts ROCm 7.1
+          # supports.
           - {
+              os: ubuntu-latest,
               target: x86_64-unknown-linux-gnu,
               suffix: rocm,
               features: rocm,
-              image: "rocm/dev-ubuntu-24.04:7.1.1",
+              image: "rocm/dev-ubuntu-22.04:7.1.1",
             }
 
           # Vulkan: no SDK needed to build, the loader is found at runtime.
           - {
+              os: ubuntu-22.04,
               target: x86_64-unknown-linux-gnu,
               suffix: vulkan,
               features: vulkan,
               image: "",
             }
 
-          # CPU (aarch64) — cross-compiled. No CUDA or ROCm on ARM here, and
-          # Vulkan is left out until there is a runner to test it on.
+          # Metal, on Apple Silicon only: macOS 26 is the last release for Intel
+          # Macs. Nothing to install: wgpu reaches Metal through the system
+          # framework, and CubeCL compiles its kernels to MSL at runtime, so
+          # as with CUDA there is no per-GPU axis.
           - {
-              target: aarch64-unknown-linux-gnu,
-              suffix: cpu,
-              features: flex,
+              os: macos-latest,
+              target: aarch64-apple-darwin,
+              suffix: metal,
+              features: metal,
               image: "",
             }
 
@@ -93,38 +111,46 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-${{ matrix.suffix }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.os }}-${{ matrix.target }}-${{ matrix.suffix }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cross
+        if: matrix.image != ''
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       # The CUDA and ROCm builds run inside their vendor's devel image, which
-      # carries the toolkit headers those backends bind against, selected
-      # per-target via cross's image override. Everything else uses cross's
-      # default images. No GPU is needed at build time and no compute
-      # capability is chosen: CubeCL compiles the kernels on the host that runs
-      # them.
+      # carries the toolkit those backends bind against, selected per-target
+      # via cross's image override. Everything else builds with cargo on the
+      # runner itself. No GPU is needed at build time and no compute
+      # capability is chosen: CubeCL compiles the kernels on the host that
+      # runs them.
+      #
+      # cross runs the container as the runner's uid, which has no passwd
+      # entry there, so `HOME` is `/` and nothing under it is writable. The
+      # ROCm build needs it to be: `cubecl-hip` compiles through a prebuilt
+      # LLVM that `tracel-llvm-bundler`'s build script downloads to
+      # `~/.cache/tracel` and unpacks to `~/.local/share/tracel`, then links
+      # statically. `/tmp` is the container's own and dies with it.
       - name: Build
         run: |
           if [ -n "${{ matrix.image }}" ]; then
+            build=cross
             export CROSS_TARGET_X86_64_UNKNOWN_LINUX_GNU_IMAGE="${{ matrix.image }}"
+            export CROSS_CONTAINER_OPTS="-e HOME=/tmp/home"
+          else
+            build=cargo
           fi
-          cross build --release --locked --target ${{ matrix.target }} \
+          "$build" build --release --locked --target ${{ matrix.target }} \
             --no-default-features --features "${{ matrix.features }}" \
             --bin super-tts-backend-qwen-tts
 
-      # `kernels/` rides along with the binary. It holds the pre-warmed autotune
-      # cache, which is the slow half of a first load — about four minutes on an
-      # RTX 3090, against under one for the compiling alone. Under a megabyte,
-      # and every namespace in it carries a device fingerprint, so the entries a
-      # machine cannot use are never looked up: one file covers every GPU it was
-      # warmed on and costs the others nothing. Shipped in every tarball,
-      # including the CPU one, rather than matched per accelerator.
+      # `COPYFILE_DISABLE` stops macOS's bsdtar adding an AppleDouble `._`
+      # entry for any file carrying extended attributes. GNU tar ignores it.
       - name: Create tarball
+        env:
+          COPYFILE_DISABLE: "1"
         run: |
           tar -czf "qwen-tts-${{ matrix.target }}-${{ matrix.suffix }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" super-tts-backend-qwen-tts \
-            -C "$GITHUB_WORKSPACE" kernels
+            -C "target/${{ matrix.target }}/release" super-tts-backend-qwen-tts
           ls -lh qwen-tts-*.tar.gz
 
       - uses: actions/upload-artifact@v7

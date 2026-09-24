@@ -180,17 +180,38 @@ template that has moved.
 
 ## Requirements
 
-A GPU is not required but is strongly recommended. The talker is a transformer
-generating 12.5 frames per second of speech. Measured on an RTX 3090 with a
-warm kernel cache, the 0.6B CustomVoice model loads in 3 seconds, sends its
-first audio 0.3 seconds into a request and synthesizes at about 6x real time —
-19 seconds of speech in 3.2. On a CPU it is slower than real time; the 0.6B
-model is the one to try without a GPU.
+A GPU is required. The talker is a transformer generating 12.5 frames per
+second of speech. Measured on an RTX 3090 with a warm kernel cache, the 0.6B
+CustomVoice model loads in 3 seconds, sends its first audio 0.3 seconds into a
+request and synthesizes at about 6x real time — 19 seconds of speech in 3.2. A
+CPU is nowhere near that: the 1.7B talker generated about one frame every ten
+seconds on one, so there is no CPU build.
 
-Releases ship six builds: a CPU build for x86_64 and aarch64, CUDA 12 and
-CUDA 13, ROCm, and Vulkan. The daemon picks the one matching the machine, and
-ranks a native backend above Vulkan above the CPU. There is no
-compute-capability axis — see the manifest for why.
+Releases ship five builds. On Linux: CUDA 12 and CUDA 13, ROCm, and Vulkan. On
+Apple Silicon Macs: Metal. The daemon picks the one matching the machine, and
+ranks a native backend above Vulkan. There is no compute-capability axis — see
+the manifest for why.
+
+Only CUDA computes the talker in bf16, the type the checkpoints were trained in;
+every other GPU gets f16, because CubeCL cannot compile bf16 there. On Vulkan
+its SPIR-V backend emits bf16 arithmetic, which `SPV_KHR_bfloat16` does not
+allow — bf16 there is for conversions, dot products and cooperative matrices
+only — so those shaders are invalid on any Vulkan driver, and NVIDIA's segfaults
+compiling them rather than rejecting them. On ROCm it compiles through LLVM,
+whose lowering has no bf16 type at all, and Metal's backend reports none. f16
+holds the model: the largest value in a 1.7B prefill is 9.6e3, against the 6.5e4
+f16 reaches. A device without f16 gets f32. On Vulkan the codec decoder's
+convolutions run in f16 too, with everything around them in f32: a Vulkan device
+computes f32 convolutions without its matrix units, and on an RTX 3090 that left
+the codec alone slower than real time, 2.9 seconds of decoding for every 2 of
+audio. In f16 they take 0.1 seconds. f16 has the 10-bit mantissa of the TF32
+that CUDA runs them at, and the decoded audio stays 52 to 65 dB from an f32
+decode, around 60, where the decoder's own noise is 65.
+
+Measured on the RTX 3090 with NVIDIA's 610.57.04 driver, the 1.7B CustomVoice
+model on Vulkan synthesizes at 3.0 to 3.5x real time, against 3.7 to 4.2x on
+CUDA. Its first load, with its own kernel cache and the driver's shader cache
+both empty, takes about two minutes.
 
 Weights are downloaded by the daemon before the first load. This process has no
 network at all — it runs with `PrivateNetwork=yes` and a read-only backend
@@ -219,8 +240,7 @@ the code predictor, the sampler and the codec decoder at the shapes real
 requests use.
 
 `ready` then means ready rather than ready-after-one-more-long-wait, and the
-wait lands while the daemon is still showing its loading indicator, where it
-allows ten minutes.
+wait lands while the daemon is still showing the load's progress.
 
 The ladder is not decoration. With a single warmed length, requests near it
 were fast and everything else stalled on its first use — a 140-character
@@ -248,117 +268,36 @@ What that wait costs, on an RTX 3090:
 
 | Load | Time | What it pays for |
 |---|---|---|
-| Nothing cached | ~4 minutes | Compiling a few hundred kernels and tuning every shape the warm-up walks. Once per GPU. |
+| Nothing cached | ~7 minutes on CUDA, ~2 on Vulkan | Compiling a few hundred kernels and tuning every shape the warm-up walks. Once per GPU. |
 | After a backend upgrade | under a minute | Compiling only: the cache keys kernels by build, but the tuning results survive it. |
 | Same build again | 5.5 seconds | Mapping the weights, and a warm-up that finds everything already there. |
 
 The first row is the one to design around, and it is the reason the cache
 directory exists at all — without it, *every* load is that row, and without the
-warm-up the same four minutes land on whoever sends the first request.
+warm-up the same minutes land on whoever sends the first request.
 
-### Shipping a warm cache
-
-The four-minute row above is work that is identical on every machine with the
-same GPU, so it does not have to be done on every machine. CubeCL can export a
-warm cache as a *bundle*, and this backend ships one in `kernels/`, inside the
-release tarball beside the binary.
-
-What it holds is the tuning, not the compiled kernels. On an RTX 3090 that is
-147 MB of PTX against **996 KB** of autotune results — and the small half is
-both the expensive one to produce and the durable one:
-
-| | size | cost to redo | survives a rebuild |
-|---|---:|---|---|
-| Compiled kernels (PTX) | 147 MB | under a minute | no — keyed by the source that generated them |
-| Autotune results | 996 KB | the rest of the four minutes | yes — keyed by operation and shape |
-
-So the bundle is autotune-only. Shipping the PTX as well would multiply the
-tarball by 160 to save the minute, and it would have to be rebuilt and
-re-uploaded for every release.
-
-**One file for every GPU, and for every model.** Nothing in the cache is keyed
-by model — the namespaces are keyed by CubeCL version, device and kernel family
-— so the five checkpoints share whatever shapes they share, and they share most
-of them. Warming all five into one cache costs almost nothing over warming the
-first:
-
-| warmed, in order | its ladder | cache after |
-|---|---:|---:|
-| `0.6b-base` | 78.4s | 37 MB |
-| `0.6b-custom-voice` | 10.1s | 40 MB |
-| `1.7b-base` | 33.5s | 51 MB |
-| `1.7b-custom-voice` | 6.6s | 55 MB |
-| `1.7b-voice-design` | 5.2s | 55 MB |
-
-Each model after the first costs a fraction of it, and the last adds nothing at
-all: only the jump from 0.6B to 1.7B brings genuinely new shapes. All five
-together are 288 entries and 996 KB, against 261 and 900 KB for `0.6b-base`
-alone — so covering the whole backend costs about 96 KB more than covering one
-model of it. Entries for a device this machine is not
-simply never get looked up, which is what makes merging every architecture into
-one file free for the machines that do not match. It is imported once at
-startup, before any device exists:
-
-```
-imported 288 kernel-cache entries from kernels/autotune.bundle in 6.9ms
-  (9 namespaces, 0 already present, 0 refused)
-```
-
-Nothing about it can make a load fail. A missing file, a corrupt one, or one
-warmed on a GPU nobody here has all end in the same place — a warning and the
-cold load that happened before bundles existed.
-
-**Adding an architecture.** Run the exporter on the hardware it is for. With
-`--warm` it loads the model first, filling the cache by running the same ladder
-above; point `SUPER_TTS_BACKEND_CACHE_DIR` at an empty directory so what comes
-out is that cold load and nothing else:
-
-```sh
-SUPER_TTS_BACKEND_DIR=~/.local/share/super-tts/backends/app.super-tts.qwen-tts \
-SUPER_TTS_BACKEND_CACHE_DIR=$(mktemp -d) \
-CUDA_CACHE_PATH=~/.cache/qwen-tts-export/nv \
-  ./super-tts-backend-qwen-tts export-kernels \
-      --warm qwen3-tts-0.6b-base \
-      kernels/autotune.bundle \
-      "RTX 3090 Linux"
-```
-
-The two cache paths want opposite lifetimes, which is easy to get backwards.
-`SUPER_TTS_BACKEND_CACHE_DIR` must be **empty every time**: it is what the
-bundle is cut from, and a directory carrying another model's entries ships them
-too. `CUDA_CACHE_PATH` should be **the same path every time**: it holds the
-driver's PTX-to-SASS translations, which no bundle carries and which cost about
-110 MB of work per cold load, so reusing it makes repeated exports much faster.
-
-Set it to something, though. Running outside the daemon means running outside
-the sandbox, and the NVIDIA driver defaults to `$HOME/.nv/ComputeCache` — so an
-export with this unset writes into the cache every other CUDA program on the
-machine shares, and quietly makes later measurements on this backend look
-better than a new user's would. Under the daemon the question does not arise:
-the sandbox sets `CUDA_CACHE_PATH` inside the one writable directory it grants.
-
-Without `--warm` it exports the cache as it stands, which is for a machine that
-has been running the backend already and wants to package what it learned.
-`--everything` includes the compiled kernels, which is for measuring what that
-147 MB would buy rather than for shipping.
-
-To *add* to the file rather than replace it, import the existing bundle into the
-empty cache first — the exporter writes whatever the cache holds, and importing
-is insert-only, so warming on a second GPU and exporting again yields a file
-covering both.
-
-The exporting binary must be the same build as the consuming one: the CubeCL
-version is part of every namespace, which is why the exporter lives in this
-binary rather than a tool beside it.
+While it loads, `GET /v1/status` says how far it has got, in the `phase`,
+`step` and `progress` fields the contract defines. `phase` is `initial_setup`
+on the first load of a model with a build and `loading` after: a marker beside
+the kernels, written once a warm-up runs to the end, tells them apart, so
+clearing the cache makes the next load an initial setup again. `step` is
+`loading_weights`, measured by the bytes of the checkpoints read, then
+`building_kernels` on an initial setup or `warming_up` after. The warm-up is
+measured by the entries CubeCL writes to the cache — 1754 of them on CUDA and
+726 on Vulkan from empty — plus one per frame it generates, which is what keeps
+the bar moving where nothing is compiled. The daemon fails a load whose step and
+progress stand still for two minutes; on the RTX 3090 the longest stretch
+without either moving was 4.7 seconds on CUDA and 1.6 on Vulkan.
 
 ### Building
 
 ```sh
 git clone https://github.com/super-libre/super-tts-qwen-tts
-just build-release          # the pure-Rust CPU backend
+just build-release          # Vulkan, the default: needs nothing to build
 just build-cuda             # needs the CUDA headers — no GPU, no compute capability
 just build-rocm             # needs the ROCm headers
-just build-vulkan           # needs nothing; the loader is found at runtime
+just build-vulkan           # the same as build-release
+just build-metal            # macOS; needs nothing beyond Xcode's SDK
 ```
 
 There is no submodule and no C toolchain to install. The first build is slow
@@ -366,12 +305,14 @@ because Burn is a git dependency and has to be fetched and compiled.
 
 Each build carries exactly one accelerator, which is why the recipes pass
 `--no-default-features`. Cargo features are additive, so `--features cuda` on
-its own would keep the default `flex` backend too and link both.
+its own would keep the default `vulkan` backend too and link both.
 
-`just test` runs the suite. One test tokenizes the chat template and compares
-against ids produced by the reference `onig` tokenizer; it skips unless
-`tokenizer.json` is present, so `just test-tokenizer` fetches it once and runs
-everything. `just ci` is the full local gate.
+`just test` runs the suite, on `flex`, a pure-Rust CPU backend that exists only
+for it: CI has no GPU, and this way the transformer, the codec and the sampler
+are still exercised there. It is not a way to run the model. One test tokenizes
+the chat template and compares against ids produced by the reference `onig`
+tokenizer; it skips unless `tokenizer.json` is present, so `just test-tokenizer`
+fetches it once and runs everything. `just ci` is the full local gate.
 
 **Burn comes from a fork.** `Cargo.toml` pins `jorge-menjivar/burn` at
 `e7897a65`, which is upstream Burn plus six fixes to `burn-cubecl-fusion` the
@@ -406,6 +347,7 @@ making the directory installable with the daemon's import-from-directory path.
 | `src/server.rs` | The `/v1` routes, and the error codes the contract names. |
 | `src/model.rs` | Loading, generation, and the chunked decode that makes streaming seamless. |
 | `src/model_thread.rs` | The thread the model lives on, because Burn's generation state is not `Send`. |
+| `src/progress.rs` | What a load reports while it runs: the `phase`, `step` and `progress` of `GET /v1/status`. |
 | `src/qwen3/` | The model itself, vendored from Burn's `qwen3-tts` example. |
 | `src/prompt.rs` | The chat template, and its cross-check against the reference tokenizer. |
 | `src/voices.rs` | The three voice id shapes, which ones a checkpoint can resolve, and the twelve designed voices. |
