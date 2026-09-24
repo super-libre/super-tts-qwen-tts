@@ -27,6 +27,7 @@
 //! runtime.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -643,13 +644,28 @@ static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Where a load records that `model` finished a warm-up with this build, so
 /// that the next load of it is not an initial setup. It sits beside the
-/// kernels it vouches for: clearing the cache clears it too, and a new build
-/// looks for one of its own. Without a cache directory there is none, and
-/// every load is an initial setup, since every load compiles everything.
+/// kernels it vouches for, so clearing the cache clears it too. Without a
+/// cache directory there is none, and every load is an initial setup, since
+/// every load compiles everything.
+///
+/// Named by the binary's build ID, which is what `CubeCL` keys its compiled
+/// kernels on: any rebuild, a release that keeps its version included,
+/// recompiles all of them, and should say so. Without a build ID the crate
+/// version stands in; every release asset has one, the GNU build ID on Linux
+/// and `LC_UUID` on macOS.
 fn warm_marker(model: &str) -> Option<PathBuf> {
+    let build = buildid::build_id().map_or_else(
+        || env!("CARGO_PKG_VERSION").to_string(),
+        |id| {
+            id.iter().fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+        },
+    );
     CACHE_DIR.get().map(|dir| {
         dir.join("qwen-tts-warm")
-            .join(format!("{model}-{}-{BUILT_FOR}", env!("CARGO_PKG_VERSION")))
+            .join(format!("{model}-{BUILT_FOR}-{build}"))
     })
 }
 

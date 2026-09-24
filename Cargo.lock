@@ -6245,6 +6245,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "buildid",
  "burn",
  "burn-cubecl",
  "burn-fusion",

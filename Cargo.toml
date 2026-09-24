@@ -27,6 +27,10 @@
     # `POST /v1/voices` carries its reference clip as base64 inside the JSON
     # body, which is the only place this backend meets the encoding.
     base64 = "0.22"
+    # The binary's build ID, which CubeCL keys its compiled kernels on: the
+    # warm marker in `model.rs` goes by the same key. Already in the graph
+    # through CubeCL.
+    buildid = "1"
     bytes = "1"
     # The model in `src/qwen3` is Burn's, vendored from this fork's `qwen3-tts`
     # example (see that module's provenance note). Burn is pinned by revision:
