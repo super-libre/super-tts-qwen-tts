@@ -193,9 +193,11 @@ daemon picks the one matching the machine, and ranks a GPU backend above the
 CPU. There is no compute-capability axis — see the manifest for why.
 
 There is no Vulkan build. Burn can target it, and it was tried on an RTX 3090
-with NVIDIA's 610.57.04 driver. The talker's bf16 kernels crash the driver's
-SPIR-V compiler, a device that does not report bf16 to begin with. In f16 the
-model never stops talking. In f32 it runs, but only with graph capture off,
+with NVIDIA's 610.57.04 driver. The talker runs in bf16 on a GPU, and CubeCL's
+SPIR-V backend emits bf16 arithmetic, which `SPV_KHR_bfloat16` does not allow:
+bf16 there is for conversions, dot products and cooperative matrices only. The
+shaders are invalid on any Vulkan driver; NVIDIA's segfaults compiling them
+rather than rejecting them. In f16 the model never stops talking. In f32 it runs, but only with graph capture off,
 because the captured pass does a host-to-device write that a wgpu capture
 cannot record, and eagerly it manages about 0.4× real time on either model
 size. The commit that removed it records what bringing it back would take.
