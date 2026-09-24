@@ -759,16 +759,23 @@ impl QwenTts {
 
         // The codec runs in f32 whatever the talker's dtype: it is a small part
         // of the compute and the decoder is where audible artefacts would show.
+        // Its convolutions are the exception on Vulkan, see below.
         //
         // The Base checkpoints also need the codec's *encoder*, to turn a
         // cloning reference into the codes an in-context example is made of.
         // Only they: it is weights and load time no other family would use.
-        let speech_tokenizer = if kind == Kind::Base {
+        let mut speech_tokenizer = if kind == Kind::Base {
             SpeechTokenizer::load_with_encoder(&st_config, &st_weights_file, &device)
         } else {
             SpeechTokenizer::load(&st_config, &st_weights_file, &device)
         }
         .map_err(|e| anyhow!("building the codec from {}: {e}", st_weights_file.display()))?;
+        // Where the talker computes in f16, which is Vulkan, so do the decoder's
+        // convolutions, or the codec alone runs slower than real time. See
+        // `SpeechTokenizer::convolve_in` for what that costs.
+        if dtype == DType::F16 {
+            speech_tokenizer.convolve_in(DType::F16);
+        }
         // A Base checkpoint whose weights carry no speaker encoder can still
         // read text, but nothing it says would be in the requested voice, and
         // the daemon would have no way to learn that except by the audio
