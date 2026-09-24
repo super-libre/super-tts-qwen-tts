@@ -68,7 +68,7 @@
 #
 # One build per (target, accelerator). There is no compute-capability axis:
 # Burn compiles every kernel at runtime through CubeCL — NVRTC on CUDA, hiprtc
-# on ROCm, SPIR-V on Vulkan — so one CUDA build serves every NVIDIA generation
+# on ROCm, MSL on Metal — so one CUDA build serves every NVIDIA generation
 # the installed driver can compile for, where an ahead-of-time build needs one
 # asset per SM. What is left is the CUDA major version, which decides the API
 # the binary was built against.
@@ -113,13 +113,10 @@
         "gfx1201",
     ]
 
-# No Vulkan asset. The build exists (`just build-vulkan`) but does not run: on
-# NVIDIA's 610.57.04 driver every load segfaults inside the driver's SPIR-V
-# compiler while it builds a bf16 reduce kernel, and an NVIDIA card without
-# CUDA installed is one of the hosts that asset was for. When it comes back,
-# its floor is `vulkan_api = "1.2"`: the sampling kernel reduces across a
-# plane, and the subgroup types that needs are core in Vulkan 1.2 (CubeCL
-# reaches for `VK_KHR_shader_subgroup_extended_types` below it).
+# No Vulkan asset: the backend has no Vulkan build any more (see the README).
+# If it comes back, its floor is `vulkan_api = "1.2"`: the sampling kernel
+# reduces across a plane, and the subgroup types that needs are core in Vulkan
+# 1.2 (CubeCL reaches for `VK_KHR_shader_subgroup_extended_types` below it).
 
 [[assets.subprocess]]
     file = "qwen-tts-aarch64-unknown-linux-gnu-cpu.tar.gz"

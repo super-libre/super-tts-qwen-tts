@@ -430,24 +430,14 @@ const BUILT_FOR: &str = if cfg!(feature = "cuda") {
     "cuda"
 } else if cfg!(feature = "rocm") {
     "rocm"
-} else if cfg!(feature = "vulkan") {
-    "vulkan"
 } else if cfg!(feature = "metal") {
     "metal"
-} else if cfg!(feature = "wgpu") {
-    "wgpu"
 } else {
     "cpu"
 };
 
 /// Whether [`BUILT_FOR`] is a GPU, which decides the talker's dtype.
-const ON_GPU: bool = cfg!(any(
-    feature = "cuda",
-    feature = "rocm",
-    feature = "vulkan",
-    feature = "metal",
-    feature = "wgpu"
-));
+const ON_GPU: bool = cfg!(any(feature = "cuda", feature = "rocm", feature = "metal"));
 
 /// The device this build runs on, and the name to report for it.
 ///
@@ -472,31 +462,10 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
     return (Device::cuda(0), "cuda");
     #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
     return (Device::rocm(0), "rocm");
-    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "vulkan"))]
-    return (
-        Device::vulkan(burn::prelude::DeviceKind::DefaultDevice),
-        "vulkan",
-    );
-    #[cfg(all(
-        not(feature = "cuda"),
-        not(feature = "rocm"),
-        not(feature = "vulkan"),
-        feature = "metal"
-    ))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "metal"))]
     return (
         Device::metal(burn::prelude::DeviceKind::DefaultDevice),
         "metal",
-    );
-    #[cfg(all(
-        not(feature = "cuda"),
-        not(feature = "rocm"),
-        not(feature = "vulkan"),
-        not(feature = "metal"),
-        feature = "wgpu"
-    ))]
-    return (
-        Device::wgpu(burn::prelude::DeviceKind::DefaultDevice),
-        "wgpu",
     );
     // Both CPU backends report `cpu`: they are one accelerator as far as the
     // manifest and the daemon are concerned, and which one a build carries is
@@ -504,18 +473,14 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
-        not(feature = "vulkan"),
         not(feature = "metal"),
-        not(feature = "wgpu"),
         feature = "cpu"
     ))]
     return (Device::cpu(), "cpu");
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
-        not(feature = "vulkan"),
         not(feature = "metal"),
-        not(feature = "wgpu"),
         not(feature = "cpu"),
         feature = "flex"
     ))]
@@ -523,9 +488,7 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
-        not(feature = "vulkan"),
         not(feature = "metal"),
-        not(feature = "wgpu"),
         not(feature = "cpu"),
         not(feature = "flex")
     ))]

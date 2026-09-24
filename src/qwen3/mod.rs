@@ -66,14 +66,7 @@
 pub mod config;
 pub mod model;
 pub mod sampling;
-#[cfg(any(
-    feature = "cuda",
-    feature = "rocm",
-    feature = "metal",
-    feature = "vulkan",
-    feature = "wgpu",
-    feature = "cpu"
-))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "metal", feature = "cpu"))]
 pub mod sampling_kernel;
 pub mod speaker_encoder;
 pub mod speech_tokenizer;

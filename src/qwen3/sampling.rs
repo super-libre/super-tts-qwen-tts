@@ -43,14 +43,7 @@ impl Sampling {
     /// One kernel does it on the GPU backends, see [`crate::qwen3::sampling_kernel`]; elsewhere it is
     /// the tensor operations of [`Sampling::draw_ops`].
     pub fn draw(&self, logits: Tensor<1>, noise: Tensor<1>) -> Tensor<1, Int> {
-        #[cfg(any(
-            feature = "cuda",
-            feature = "rocm",
-            feature = "metal",
-            feature = "vulkan",
-            feature = "wgpu",
-            feature = "cpu"
-        ))]
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal", feature = "cpu"))]
         if KERNEL.load(Ordering::Relaxed)
             && crate::qwen3::sampling_kernel::available(&logits.device())
         {
@@ -210,14 +203,7 @@ mod tests {
 
     /// The kernel and the operations draw the same token from the same noise, but where a
     /// threshold falls between two entries that round differently.
-    #[cfg(any(
-        feature = "cuda",
-        feature = "rocm",
-        feature = "metal",
-        feature = "vulkan",
-        feature = "wgpu",
-        feature = "cpu"
-    ))]
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "metal", feature = "cpu"))]
     #[test]
     fn kernel_matches_operations() {
         let device = device();

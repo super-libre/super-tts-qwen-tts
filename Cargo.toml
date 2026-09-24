@@ -38,8 +38,8 @@
     # drains the calling stream first, where it freed nothing dropped since the
     # last sync.
     #
-    # Burn is what buys this backend ROCm and Vulkan, which candle cannot
-    # reach at all — CubeCL compiles every kernel at runtime for whatever
+    # Burn is what buys this backend ROCm, which candle cannot reach at
+    # all — CubeCL compiles every kernel at runtime for whatever
     # device it finds, which is also why one build per target covers every GPU
     # generation instead of one per CUDA compute capability.
     burn = {
@@ -108,8 +108,6 @@
     flex = ["burn/flex"]
     metal = ["burn/metal"]
     rocm = ["burn/rocm"]
-    vulkan = ["burn/vulkan"]
-    wgpu = ["burn/wgpu"]
 
 [lints.clippy]
     pedantic = "warn"

@@ -22,8 +22,8 @@ with framed PCM.
 
 Burn is what makes this the widest-reaching backend here. Its kernels are
 compiled at runtime by CubeCL, so one binary per accelerator covers every GPU
-generation the driver can compile for — and the accelerators include ROCm and
-Vulkan, which the candle-based backends cannot reach at all.
+generation the driver can compile for — and the accelerators include ROCm,
+which the candle-based backends cannot reach at all.
 
 Synthesis has two halves, and the split is why speech starts before the
 utterance is finished:
@@ -192,9 +192,13 @@ Releases ship seven builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
 daemon picks the one matching the machine, and ranks a GPU backend above the
 CPU. There is no compute-capability axis — see the manifest for why.
 
-Vulkan builds but is not released: on NVIDIA's 610.57.04 driver every load
-segfaults inside the driver's SPIR-V compiler on a bf16 reduce kernel, so the
-kernel bundle has no Vulkan entries either.
+There is no Vulkan build. Burn can target it, and it was tried on an RTX 3090
+with NVIDIA's 610.57.04 driver. The talker's bf16 kernels crash the driver's
+SPIR-V compiler, a device that does not report bf16 to begin with. In f16 the
+model never stops talking. In f32 it runs, but only with graph capture off,
+because the captured pass does a host-to-device write that a wgpu capture
+cannot record, and eagerly it manages about 0.4× real time on either model
+size. The commit that removed it records what bringing it back would take.
 
 Weights are downloaded by the daemon before the first load. This process has no
 network at all — it runs with `PrivateNetwork=yes` and a read-only backend
@@ -364,7 +368,6 @@ git clone https://github.com/super-libre/super-tts-qwen-tts
 just build-release          # the pure-Rust CPU backend
 just build-cuda             # needs the CUDA headers — no GPU, no compute capability
 just build-rocm             # needs the ROCm headers
-just build-vulkan           # needs nothing; the loader is found at runtime
 just build-metal            # macOS; needs nothing beyond Xcode's SDK
 ```
 

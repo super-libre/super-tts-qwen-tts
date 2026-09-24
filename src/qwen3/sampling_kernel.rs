@@ -27,8 +27,6 @@ use std::marker::PhantomData;
     feature = "cuda",
     feature = "rocm",
     feature = "metal",
-    feature = "vulkan",
-    feature = "wgpu",
     feature = "cpu"
 )))]
 pub trait SamplingBackend: burn::backend::Backend {

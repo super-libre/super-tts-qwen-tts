@@ -132,10 +132,7 @@ jobs:
               image: "rocm/dev-ubuntu-22.04:7.1.1",
             }
 
-          # No Vulkan build: it segfaults in NVIDIA's driver compiling a bf16
-          # reduce kernel (see `backend.toml`). Bringing it back is an entry
-          # here with `features: vulkan` on ubuntu-22.04 and no image, plus its
-          # asset in `backend.toml`.
+          # No Vulkan build: the backend has none (see the README).
 
           # CPU (aarch64), built natively on an arm64 runner. No CUDA or ROCm
           # on ARM here.
