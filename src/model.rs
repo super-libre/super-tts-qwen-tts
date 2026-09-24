@@ -430,14 +430,51 @@ const BUILT_FOR: &str = if cfg!(feature = "cuda") {
     "cuda"
 } else if cfg!(feature = "rocm") {
     "rocm"
+} else if cfg!(feature = "vulkan") {
+    "vulkan"
 } else if cfg!(feature = "metal") {
     "metal"
+} else if cfg!(feature = "wgpu") {
+    "wgpu"
 } else {
     "cpu"
 };
 
 /// Whether [`BUILT_FOR`] is a GPU, which decides the talker's dtype.
-const ON_GPU: bool = cfg!(any(feature = "cuda", feature = "rocm", feature = "metal"));
+const ON_GPU: bool = cfg!(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan",
+    feature = "metal",
+    feature = "wgpu"
+));
+
+/// The type the talker computes in on `device`.
+///
+/// A half-width type halves the talker's weights and its bandwidth on a GPU.
+/// On the CPU it is slower than f32 rather than faster.
+///
+/// bf16 is what the checkpoints were trained in and what CUDA and ROCm get.
+/// Never on Vulkan, whatever the device reports: the SPIR-V extension for bf16
+/// allows no arithmetic on it, yet CubeCL emits some, and NVIDIA's driver
+/// crashes compiling it. Vulkan, and the generic `wgpu` backend, which is
+/// Vulkan on Linux, get f16 instead. It holds the talker: the largest value
+/// of a 1.7B prefill, the product inside the MLP of its third layer, is
+/// 9.6e3 of the 6.5e4 f16 reaches, and the speech ends where it should. A
+/// device that computes in neither type gets f32, which is Metal's case:
+/// CubeCL's Metal backend reports no bf16.
+fn talker_dtype(device: &Device) -> DType {
+    let half = if matches!(BUILT_FOR, "vulkan" | "wgpu") {
+        DType::F16
+    } else {
+        DType::BF16
+    };
+    if ON_GPU && device.supports_dtype(half) {
+        half
+    } else {
+        DType::F32
+    }
+}
 
 /// The device this build runs on, and the name to report for it.
 ///
@@ -462,10 +499,31 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
     return (Device::cuda(0), "cuda");
     #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
     return (Device::rocm(0), "rocm");
-    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "metal"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "vulkan"))]
+    return (
+        Device::vulkan(burn::prelude::DeviceKind::DefaultDevice),
+        "vulkan",
+    );
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(feature = "rocm"),
+        not(feature = "vulkan"),
+        feature = "metal"
+    ))]
     return (
         Device::metal(burn::prelude::DeviceKind::DefaultDevice),
         "metal",
+    );
+    #[cfg(all(
+        not(feature = "cuda"),
+        not(feature = "rocm"),
+        not(feature = "vulkan"),
+        not(feature = "metal"),
+        feature = "wgpu"
+    ))]
+    return (
+        Device::wgpu(burn::prelude::DeviceKind::DefaultDevice),
+        "wgpu",
     );
     // Both CPU backends report `cpu`: they are one accelerator as far as the
     // manifest and the daemon are concerned, and which one a build carries is
@@ -473,14 +531,18 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
+        not(feature = "vulkan"),
         not(feature = "metal"),
+        not(feature = "wgpu"),
         feature = "cpu"
     ))]
     return (Device::cpu(), "cpu");
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
+        not(feature = "vulkan"),
         not(feature = "metal"),
+        not(feature = "wgpu"),
         not(feature = "cpu"),
         feature = "flex"
     ))]
@@ -488,7 +550,9 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
+        not(feature = "vulkan"),
         not(feature = "metal"),
+        not(feature = "wgpu"),
         not(feature = "cpu"),
         not(feature = "flex")
     ))]
@@ -674,9 +738,7 @@ impl QwenTts {
         let ignores_instructions = config.tts_model_size == "0b6";
 
         let (device, device_name) = select_device(device);
-        // bf16 halves the talker's weights and its bandwidth on a GPU. On the
-        // CPU it is slower than f32 rather than faster.
-        let dtype = if ON_GPU { DType::BF16 } else { DType::F32 };
+        let dtype = talker_dtype(&device);
         log::info!(
             "loading {model_name} on {device_name} ({dtype:?}) from {}",
             dir.display()

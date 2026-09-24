@@ -37,6 +37,11 @@ build-cuda *args:
 build-rocm *args:
     cargo build --release --locked --no-default-features --features rocm {{ args }}
 
+# Build with Vulkan — the vendor-neutral GPU path. Needs no SDK to build; the
+# loader is found at runtime.
+build-vulkan *args:
+    cargo build --release --locked --no-default-features --features vulkan {{ args }}
+
 # Build with Metal, on macOS. Needs nothing beyond the SDK Xcode's command line
 # tools carry; the kernels are compiled to MSL at runtime.
 build-metal *args:
