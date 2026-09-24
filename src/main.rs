@@ -111,7 +111,14 @@ fn export_kernels(backend_dir: &Path, args: &[String]) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // CubeCL's ROCm compiler, pliron, logs its whole IR after every pass at
+    // `info`, which is the level the daemon runs backends at: one cold load
+    // wrote a 10 GB log in about seven minutes on an AMD card. `RUST_LOG`
+    // still turns it back on, as `pliron=info`.
+    env_logger::Builder::new()
+        .filter_module("pliron", log::LevelFilter::Warn)
+        .parse_env(env_logger::Env::default().default_filter_or("info"))
+        .init();
 
     // Before anything else touches a device: the GPU kernels are compiled at
     // runtime and the configuration that says where to keep them is frozen the
