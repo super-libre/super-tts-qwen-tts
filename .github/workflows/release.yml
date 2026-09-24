@@ -12,56 +12,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # `kernels/autotune.bundle` only works with the CubeCL it was exported
-  # from: the version is part of every namespace in it, and CubeCL imports a
-  # bundle from another version with a warning and then never looks its
-  # entries up. So a CubeCL bump without a re-export would ship a bundle that
-  # does nothing, and every user would pay the full cold load. This fails the
-  # release first. It cannot see a change in the shapes the model runs under
-  # the same CubeCL; re-export after those too.
-  kernel-bundle:
-    name: Kernel bundle matches CubeCL
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Compare the bundle's CubeCL with Cargo.lock's
-        run: |
-          python3 - <<'EOF'
-          import collections, json, sqlite3, sys, tomllib
-
-          lock = tomllib.load(open("Cargo.lock", "rb"))
-          versions = {p["version"] for p in lock["package"] if p["name"] == "cubecl-environment"}
-          if len(versions) != 1:
-              sys.exit(f"::error file=Cargo.lock::expected one cubecl-environment in Cargo.lock, found {sorted(versions)}")
-          (want,) = versions
-
-          db = sqlite3.connect("file:kernels/autotune.bundle?mode=ro", uri=True)
-          manifest = json.loads(db.execute("select v from meta where k = 'manifest'").fetchone()[0])
-          counts = collections.Counter()
-          stale = collections.Counter()
-          for namespace, n in db.execute("select namespace, count(*) from entries group by namespace"):
-              kind, version, device, *_ = namespace.split("/")
-              counts[f"{kind} {device}"] += n
-              if version != want:
-                  stale[version] += n
-
-          print(f"bundle {manifest['name']!r}, exported for CubeCL {manifest['cubecl_version']}; Cargo.lock has {want}")
-          for what, n in sorted(counts.items()):
-              print(f"  {n:4} {what}")
-
-          if manifest["cubecl_version"] != want or stale:
-              sys.exit(
-                  "::error file=kernels/autotune.bundle::kernels/autotune.bundle was exported for CubeCL "
-                  f"{manifest['cubecl_version']} ({dict(stale) or 'every namespace'}), but this build links {want}. "
-                  "CubeCL ignores entries from another version, so the release would ship a bundle that does "
-                  "nothing. Re-export it with this build (README, \"Shipping a warm cache\")."
-              )
-          EOF
-
   build:
     name: Build ${{ matrix.target }} ${{ matrix.suffix }}
-    needs: kernel-bundle
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -220,14 +172,6 @@ jobs:
             --no-default-features --features "${{ matrix.features }}" \
             --bin super-tts-backend-qwen-tts
 
-      # `kernels/` rides along with the binary. It holds the pre-warmed autotune
-      # cache, which is the slow half of a first load — about four minutes on an
-      # RTX 3090, against under one for the compiling alone. Under a megabyte,
-      # and every namespace in it carries a device fingerprint, so the entries a
-      # machine cannot use are never looked up: one file covers every GPU it was
-      # warmed on and costs the others nothing. Shipped in every tarball,
-      # including the CPU one, rather than matched per accelerator.
-      #
       # `COPYFILE_DISABLE` stops macOS's bsdtar adding an AppleDouble `._`
       # entry for any file carrying extended attributes. GNU tar ignores it.
       - name: Create tarball
@@ -235,8 +179,7 @@ jobs:
           COPYFILE_DISABLE: "1"
         run: |
           tar -czf "qwen-tts-${{ matrix.target }}-${{ matrix.suffix }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" super-tts-backend-qwen-tts \
-            -C "$GITHUB_WORKSPACE" kernels
+            -C "target/${{ matrix.target }}/release" super-tts-backend-qwen-tts
           ls -lh qwen-tts-*.tar.gz
 
       - uses: actions/upload-artifact@v7

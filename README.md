@@ -211,8 +211,8 @@ decode, around 60, where the decoder's own noise is 65.
 
 Measured on the RTX 3090 with NVIDIA's 610.57.04 driver, the 1.7B CustomVoice
 model on Vulkan synthesizes at 3.0 to 3.5x real time, against 3.7 to 4.2x on
-CUDA, and loads in 71 seconds from an empty cache. The kernel bundle has no
-Vulkan entries yet, so that is every first load.
+CUDA. Its first load, with its own kernel cache and the driver's shader cache
+both empty, takes about two minutes.
 
 Weights are downloaded by the daemon before the first load. This process has no
 network at all — it runs with `PrivateNetwork=yes` and a read-only backend
@@ -269,13 +269,13 @@ What that wait costs, on an RTX 3090:
 
 | Load | Time | What it pays for |
 |---|---|---|
-| Nothing cached | ~4 minutes | Compiling a few hundred kernels and tuning every shape the warm-up walks. Once per GPU. |
+| Nothing cached | ~7 minutes on CUDA, ~2 on Vulkan | Compiling a few hundred kernels and tuning every shape the warm-up walks. Once per GPU. |
 | After a backend upgrade | under a minute | Compiling only: the cache keys kernels by build, but the tuning results survive it. |
 | Same build again | 5.5 seconds | Mapping the weights, and a warm-up that finds everything already there. |
 
 The first row is the one to design around, and it is the reason the cache
 directory exists at all — without it, *every* load is that row, and without the
-warm-up the same four minutes land on whoever sends the first request.
+warm-up the same minutes land on whoever sends the first request.
 
 While it loads, `GET /v1/status` says how far it has got, in the `phase`,
 `step` and `progress` fields the contract defines. `phase` is `initial_setup`
@@ -289,103 +289,6 @@ measured by the entries CubeCL writes to the cache — 1754 of them on CUDA and
 the bar moving where nothing is compiled. The daemon fails a load whose step and
 progress stand still for two minutes; on the RTX 3090 the longest stretch
 without either moving was 4.7 seconds on CUDA and 1.6 on Vulkan.
-
-### Shipping a warm cache
-
-The four-minute row above is work that is identical on every machine with the
-same GPU, so it does not have to be done on every machine. CubeCL can export a
-warm cache as a *bundle*, and this backend ships one in `kernels/`, inside the
-release tarball beside the binary.
-
-What it holds is the tuning, not the compiled kernels. On an RTX 3090 that is
-147 MB of PTX against **904 KB** of autotune results — and the small half is
-both the expensive one to produce and the durable one:
-
-| | size | cost to redo | survives a rebuild |
-|---|---:|---|---|
-| Compiled kernels (PTX) | 147 MB | under a minute | no — keyed by the source that generated them |
-| Autotune results | 904 KB | the rest of the four minutes | yes — keyed by operation and shape |
-
-So the bundle is autotune-only. Shipping the PTX as well would multiply the
-tarball by 160 to save the minute, and it would have to be rebuilt and
-re-uploaded for every release.
-
-**One file for every GPU, and for every model.** Nothing in the cache is keyed
-by model — the namespaces are keyed by CubeCL version, device and kernel family
-— so the five checkpoints share whatever shapes they share, and they share most
-of them. Warming all five into one cache costs almost nothing over warming the
-first:
-
-| warmed, in order | its ladder | cache after |
-|---|---:|---:|
-| `0.6b-base` | 78.4s | 37 MB |
-| `0.6b-custom-voice` | 10.1s | 40 MB |
-| `1.7b-base` | 33.5s | 51 MB |
-| `1.7b-custom-voice` | 6.6s | 55 MB |
-| `1.7b-voice-design` | 5.2s | 55 MB |
-
-Each model after the first costs a fraction of it, and the last adds nothing at
-all: only the jump from 0.6B to 1.7B brings genuinely new shapes. All five
-together are 261 entries and 904 KB, against 187 and 608 KB for `0.6b-base`
-alone — so covering the whole backend costs about 300 KB more than covering one
-model of it. Entries for another runtime are simply never looked up, which is
-what makes merging every runtime into one file free for the machines that do
-not match. Within a runtime they are shared, though: an autotune namespace names
-the runtime and the device index (`device-0-0-cuda`), not the GPU model, so any
-NVIDIA card reuses the picks this file was tuned with on an RTX 3090 rather
-than tuning its own. It is imported once at startup, before any device exists:
-
-```
-imported 261 kernel-cache entries from kernels/autotune.bundle in 3.5ms
-  (9 namespaces, 0 already present, 0 refused)
-```
-
-Nothing about it can make a load fail. A missing file, a corrupt one, or one
-warmed on a GPU nobody here has all end in the same place — a warning and the
-cold load that happened before bundles existed.
-
-**Adding an architecture.** Run the exporter on the hardware it is for. With
-`--warm` it loads the model first, filling the cache by running the same ladder
-above; point `SUPER_TTS_BACKEND_CACHE_DIR` at an empty directory so what comes
-out is that cold load and nothing else:
-
-```sh
-SUPER_TTS_BACKEND_DIR=~/.local/share/super-tts/backends/app.super-tts.qwen-tts \
-SUPER_TTS_BACKEND_CACHE_DIR=$(mktemp -d) \
-CUDA_CACHE_PATH=~/.cache/qwen-tts-export/nv \
-  ./super-tts-backend-qwen-tts export-kernels \
-      --warm qwen3-tts-0.6b-base \
-      kernels/autotune.bundle \
-      "RTX 3090 Linux"
-```
-
-The two cache paths want opposite lifetimes, which is easy to get backwards.
-`SUPER_TTS_BACKEND_CACHE_DIR` must be **empty every time**: it is what the
-bundle is cut from, and a directory carrying another model's entries ships them
-too. `CUDA_CACHE_PATH` should be **the same path every time**: it holds the
-driver's PTX-to-SASS translations, which no bundle carries and which cost about
-110 MB of work per cold load, so reusing it makes repeated exports much faster.
-
-Set it to something, though. Running outside the daemon means running outside
-the sandbox, and the NVIDIA driver defaults to `$HOME/.nv/ComputeCache` — so an
-export with this unset writes into the cache every other CUDA program on the
-machine shares, and quietly makes later measurements on this backend look
-better than a new user's would. Under the daemon the question does not arise:
-the sandbox sets `CUDA_CACHE_PATH` inside the one writable directory it grants.
-
-Without `--warm` it exports the cache as it stands, which is for a machine that
-has been running the backend already and wants to package what it learned.
-`--everything` includes the compiled kernels, which is for measuring what that
-147 MB would buy rather than for shipping.
-
-To *add* to the file rather than replace it, import the existing bundle into the
-empty cache first — the exporter writes whatever the cache holds, and importing
-is insert-only, so warming on a second GPU and exporting again yields a file
-covering both.
-
-The exporting binary must be the same build as the consuming one: the CubeCL
-version is part of every namespace, which is why the exporter lives in this
-binary rather than a tool beside it.
 
 ### Building
 
@@ -443,6 +346,7 @@ making the directory installable with the daemon's import-from-directory path.
 | `src/server.rs` | The `/v1` routes, and the error codes the contract names. |
 | `src/model.rs` | Loading, generation, and the chunked decode that makes streaming seamless. |
 | `src/model_thread.rs` | The thread the model lives on, because Burn's generation state is not `Send`. |
+| `src/progress.rs` | What a load reports while it runs: the `phase`, `step` and `progress` of `GET /v1/status`. |
 | `src/qwen3/` | The model itself, vendored from Burn's `qwen3-tts` example. |
 | `src/prompt.rs` | The chat template, and its cross-check against the reference tokenizer. |
 | `src/voices.rs` | The three voice id shapes, which ones a checkpoint can resolve, and the twelve designed voices. |
