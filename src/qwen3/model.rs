@@ -27,6 +27,8 @@ use crate::qwen3::transformer::{Transformer, TransformerConfig, TransformerState
 use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 impl CodePredictorConfig {
     fn transformer_config(&self) -> TransformerConfig {
@@ -515,11 +517,13 @@ pub struct Qwen3Tts {
 
 impl Qwen3Tts {
     /// Loads a checkpoint from its `model.safetensors` file, casting the weights to `dtype`.
+    /// `read` counts the file's bytes as they are read.
     pub fn load(
         cfg: &Config,
         weights: &std::path::Path,
         dtype: DType,
         device: &Device,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
         if cfg.talker_config.vocab_size <= NUM_SPECIAL_CODEC_TOKENS
             || cfg.talker_config.codec_eos_token_id as usize >= cfg.talker_config.vocab_size
@@ -531,7 +535,11 @@ impl Qwen3Tts {
         }
         let mut model = Model::init(cfg, device)?;
         let mut store = SafetensorsStore::from_file(weights)
-            .with_from_adapter(crate::qwen3::CheckpointAdapter.chain(FloatCastAdapter::to(dtype)))
+            .with_from_adapter(
+                crate::qwen3::ReadCounter(Arc::clone(read))
+                    .chain(crate::qwen3::CheckpointAdapter)
+                    .chain(FloatCastAdapter::to(dtype)),
+            )
             .remap(remapper(cfg)?)
             .allow_partial(true);
         let mut result = model

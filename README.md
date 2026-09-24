@@ -239,8 +239,7 @@ the code predictor, the sampler and the codec decoder at the shapes real
 requests use.
 
 `ready` then means ready rather than ready-after-one-more-long-wait, and the
-wait lands while the daemon is still showing its loading indicator, where it
-allows ten minutes.
+wait lands while the daemon is still showing the load's progress.
 
 The ladder is not decoration. With a single warmed length, requests near it
 were fast and everything else stalled on its first use — a 140-character
@@ -275,6 +274,19 @@ What that wait costs, on an RTX 3090:
 The first row is the one to design around, and it is the reason the cache
 directory exists at all — without it, *every* load is that row, and without the
 warm-up the same four minutes land on whoever sends the first request.
+
+While it loads, `GET /v1/status` says how far it has got, in the `phase`,
+`step` and `progress` fields the contract defines. `phase` is `initial_setup`
+on the first load of a model with a build and `loading` after: a marker beside
+the kernels, written once a warm-up runs to the end, tells them apart, so
+clearing the cache makes the next load an initial setup again. `step` is
+`loading_weights`, measured by the bytes of the checkpoints read, then
+`building_kernels` on an initial setup or `warming_up` after. The warm-up is
+measured by the entries CubeCL writes to the cache — 1754 of them on CUDA and
+726 on Vulkan from empty — plus one per frame it generates, which is what keeps
+the bar moving where nothing is compiled. The daemon fails a load whose step and
+progress stand still for two minutes; on the RTX 3090 the longest stretch
+without either moving was 4.7 seconds on CUDA and 1.6 on Vulkan.
 
 ### Shipping a warm cache
 

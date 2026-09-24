@@ -10,6 +10,9 @@
 //! vector quantizer. It is only needed to compute the codes of a reference recording for voice
 //! cloning, see [`SpeechTokenizer::encode`].
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use burn::module::Param;
 use burn::nn::conv::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear};
@@ -17,7 +20,7 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use burn::tensor::activation::{elu, gelu};
 use burn::tensor::ops::PadMode;
-use burn_store::{KeyRemapper, ModuleSnapshot, SafetensorsStore};
+use burn_store::{KeyRemapper, ModuleAdapter, ModuleSnapshot, SafetensorsStore};
 
 use crate::qwen3::config::{DecoderConfig, EncoderConfig, SpeechTokenizerConfig};
 use crate::qwen3::transformer::{
@@ -1108,13 +1111,14 @@ pub struct SpeechTokenizer {
 impl SpeechTokenizer {
     /// Loads the decoder from a `speech_tokenizer/model.safetensors` file. The codec runs in
     /// f32, as in the reference implementation, unless told otherwise with
-    /// [`convolve_in`](Self::convolve_in).
+    /// [`convolve_in`](Self::convolve_in). `read` counts the file's bytes as they are read.
     pub fn load(
         cfg: &SpeechTokenizerConfig,
         weights: &std::path::Path,
         device: &Device,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        Self::load_with(cfg, weights, device, false)
+        Self::load_with(cfg, weights, device, false, read)
     }
 
     /// Runs the decoder's convolutions in `dtype`: their weights are kept in it, and their
@@ -1136,8 +1140,9 @@ impl SpeechTokenizer {
         cfg: &SpeechTokenizerConfig,
         weights: &std::path::Path,
         device: &Device,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        Self::load_with(cfg, weights, device, true)
+        Self::load_with(cfg, weights, device, true, read)
     }
 
     fn load_with(
@@ -1145,6 +1150,7 @@ impl SpeechTokenizer {
         weights: &std::path::Path,
         device: &Device,
         with_encoder: bool,
+        read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let decoder_cfg = &cfg.decoder_config;
         let encoder = with_encoder
@@ -1155,7 +1161,9 @@ impl SpeechTokenizer {
             encoder,
         };
         let mut store = SafetensorsStore::from_file(weights)
-            .with_from_adapter(crate::qwen3::CheckpointAdapter)
+            .with_from_adapter(
+                crate::qwen3::ReadCounter(Arc::clone(read)).chain(crate::qwen3::CheckpointAdapter),
+            )
             .remap(remapper(cfg)?)
             .allow_partial(true);
         let result = model

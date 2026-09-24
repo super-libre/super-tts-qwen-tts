@@ -79,9 +79,12 @@ pub mod speaker_encoder;
 pub mod speech_tokenizer;
 pub mod transformer;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use burn::nn::{LinearConfig, LinearLayout};
 use burn_store::burn_pack::Tensor as PackTensor;
-use burn_store::{ModuleAdapter, ModuleContext};
+use burn_store::{ModuleAdapter, ModuleContext, bridge};
 
 /// The configuration of every linear layer of this example: the weight keeps the column-major,
 /// `[d_output, d_input]` layout of the checkpoints.
@@ -94,6 +97,28 @@ use burn_store::{ModuleAdapter, ModuleContext};
 /// rate by 2x.
 pub(crate) fn linear_config(d_input: usize, d_output: usize) -> LinearConfig {
     LinearConfig::new(d_input, d_output).with_layout(LinearLayout::Col)
+}
+
+/// Counts a checkpoint's bytes into `read` as each tensor's are drawn, which
+/// is how far a load has got. First in the chain, so it counts what the file
+/// holds rather than what a cast turns it into.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadCounter(pub Arc<AtomicU64>);
+
+impl ModuleAdapter for ReadCounter {
+    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+        let read = Arc::clone(&self.0);
+        let bytes = tensor.byte_len() as u64;
+        let (name, dtype, shape) = (tensor.name.clone(), tensor.dtype, tensor.shape.clone());
+        bridge::map_data(tensor, name, dtype, shape, move |data| {
+            read.fetch_add(bytes, Ordering::Relaxed);
+            data
+        })
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
 }
 
 /// Loads the PyTorch checkpoints into modules built with [`linear_config`].

@@ -29,6 +29,8 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use burn::prelude::{Device, Tensor};
@@ -36,6 +38,7 @@ use burn::tensor::DType;
 use tokenizers::Tokenizer;
 
 use crate::lang;
+use crate::progress::{Finish, Measure, Phase, Report, Step, Tracker};
 use crate::prompt;
 use crate::qwen3::config::{Config, SpeechTokenizerConfig};
 use crate::qwen3::model::{GenerationConfig, IclReference, Prompt, Qwen3Tts as Talker, Voice};
@@ -449,6 +452,48 @@ const ON_GPU: bool = cfg!(any(
     feature = "wgpu"
 ));
 
+/// Whether this build compiles its kernels at runtime, through `CubeCL`,
+/// which is what makes a first load an initial setup. The `flex` CPU backend
+/// does not.
+const BUILDS_KERNELS: bool = cfg!(any(
+    feature = "cuda",
+    feature = "rocm",
+    feature = "vulkan",
+    feature = "metal",
+    feature = "wgpu",
+    feature = "cpu"
+));
+
+/// The entries a first load's warm-up writes to the kernel cache, tuning
+/// results and compiled kernels both: 1754 on CUDA and 726 on Vulkan, measured
+/// on an empty cache with the 1.7B CustomVoice checkpoint on an RTX 3090. ROCm
+/// and `CubeCL`'s CPU backend are taken to be CUDA, Metal and the generic
+/// `wgpu` to be Vulkan, unmeasured. Only the pace of the bar rides on it: past
+/// the estimate it slows down short of the end rather than stopping, see
+/// `progress::estimate`, and a checkpoint that writes fewer ends its step
+/// early.
+const WARM_UP_CACHE_ENTRIES: u64 = if !BUILDS_KERNELS {
+    0
+} else if cfg!(any(feature = "vulkan", feature = "metal", feature = "wgpu")) {
+    726
+} else {
+    1754
+};
+
+/// The units of work a warm-up in `phase` is expected to do, which is what
+/// its progress is measured against: the entries it writes to the kernel
+/// cache, and one per frame it generates — every rung of the ladder, and on
+/// an initial setup the deep pass after it, both counted as far as their
+/// caps. Frames are what keep a warm load's bar, and a build without a kernel
+/// cache, moving.
+fn warm_up_work(phase: Phase) -> u64 {
+    let ladder = WARM_UP_LENGTHS.len() * (STREAM_CHUNK_FRAMES + 1);
+    match phase {
+        Phase::InitialSetup => WARM_UP_CACHE_ENTRIES + (ladder + DEEP_WARM_UP_FRAMES + 1) as u64,
+        Phase::Loading => ladder as u64,
+    }
+}
+
 /// The type the talker computes in on `device`.
 ///
 /// A half-width type halves the talker's weights and its bandwidth on a GPU.
@@ -579,6 +624,7 @@ pub fn configure_kernel_cache(cache_dir: Option<&Path>) {
     config.compilation.cache = true;
     if let Some(dir) = cache_dir {
         config.environment.path = CacheConfig::Directory(dir.to_path_buf());
+        let _ = CACHE_DIR.set(dir.to_path_buf());
     }
     // `false` means something already read the configuration and this call is
     // too late to matter. Nothing in this backend touches a device before
@@ -586,6 +632,21 @@ pub fn configure_kernel_cache(cache_dir: Option<&Path>) {
     if !CubeClRuntimeConfig::try_set(config) {
         log::warn!("the CubeCL configuration was already read; the kernel cache keeps its default");
     }
+}
+
+/// Where `CubeCL` keeps this backend's kernels, when the daemon grants a place.
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where a load records that `model` finished a warm-up with this build, so
+/// that the next load of it is not an initial setup. It sits beside the
+/// kernels it vouches for: clearing the cache clears it too, and a new build
+/// looks for one of its own. Without a cache directory there is none, and
+/// every load is an initial setup, since every load compiles everything.
+fn warm_marker(model: &str) -> Option<PathBuf> {
+    CACHE_DIR.get().map(|dir| {
+        dir.join("qwen-tts-warm")
+            .join(format!("{model}-{}-{BUILT_FOR}", env!("CARGO_PKG_VERSION")))
+    })
 }
 
 /// The pre-warmed autotune cache, shipped in the release tarball beside the
@@ -714,12 +775,75 @@ fn model_file(model_dir: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 impl QwenTts {
-    /// Load a checkpoint from a backend directory.
+    /// Load a checkpoint from a backend directory, then warm it up, reporting
+    /// how far it has got into `report` as it goes.
     ///
     /// # Errors
     /// Returns an error if a declared file is missing, the checkpoint is of a
     /// family this backend does not serve, or the weights cannot be mapped.
-    pub fn load(backend_dir: &Path, model_name: &str, device: Option<&str>) -> Result<Self> {
+    pub fn load(
+        backend_dir: &Path,
+        model_name: &str,
+        device: Option<&str>,
+        report: &(dyn Fn(Report) + Sync),
+    ) -> Result<Self> {
+        // A build without kernels to compile has no initial setup to tell
+        // apart: every one of its loads is the same.
+        let marker = BUILDS_KERNELS.then(|| warm_marker(model_name)).flatten();
+        let phase = if !BUILDS_KERNELS || marker.as_ref().is_some_and(|m| m.exists()) {
+            Phase::Loading
+        } else {
+            Phase::InitialSetup
+        };
+        let tracker = Tracker::new(phase, report);
+        let (model, warmed) = std::thread::scope(|scope| {
+            scope.spawn(|| tracker.run());
+            // Stops the sampler however this ends, a panic included: the
+            // scope waits for it before it lets a panic through.
+            let _finish = Finish(&tracker);
+            let mut model = Self::load_weights(backend_dir, model_name, device, phase, &tracker)?;
+            let step = match phase {
+                Phase::InitialSetup => Step::BuildingKernels,
+                Phase::Loading => Step::WarmingUp,
+            };
+            let frames = Arc::new(AtomicU64::new(0));
+            let entries = crate::progress::cache_entries();
+            tracker.enter(
+                step,
+                Measure::warm_up(Arc::clone(&frames), warm_up_work(phase)),
+            );
+            let warmed = model.warm_up(&frames);
+            // What `WARM_UP_CACHE_ENTRIES` and `warm_up_work` estimate, for
+            // checking them against a card they were not measured on.
+            log::info!(
+                "the warm-up wrote {} kernel-cache entries and generated {} frames, \
+                 against {} units expected",
+                crate::progress::cache_entries().saturating_sub(entries),
+                frames.load(Ordering::Relaxed),
+                warm_up_work(phase)
+            );
+            anyhow::Ok((model, warmed))
+        })?;
+        if warmed && let Some(marker) = marker {
+            let written = marker
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&marker, b""));
+            if let Err(e) = written {
+                log::warn!("could not mark {} warm: {e}", marker.display());
+            }
+        }
+        Ok(model)
+    }
+
+    /// The part of [`Self::load`] before the warm-up, under its tracker.
+    fn load_weights(
+        backend_dir: &Path,
+        model_name: &str,
+        device: Option<&str>,
+        phase: Phase,
+        tracker: &Tracker<'_>,
+    ) -> Result<Self> {
         let dir = backend_dir.join("models").join(model_name);
         let config_file = model_file(&dir, "config.json")?;
         let weights_file = model_file(&dir, "model.safetensors")?;
@@ -740,14 +864,27 @@ impl QwenTts {
         let (device, device_name) = select_device(device);
         let dtype = talker_dtype(&device);
         log::info!(
-            "loading {model_name} on {device_name} ({dtype:?}) from {}",
+            "loading {model_name} on {device_name} ({dtype:?}) from {} ({phase:?})",
             dir.display()
+        );
+        let total = [&weights_file, &st_weights_file]
+            .into_iter()
+            .try_fold(0, |sum, file| {
+                std::fs::metadata(file).map(|m| sum + m.len())
+            })?;
+        let read = Arc::new(AtomicU64::new(0));
+        tracker.enter(
+            Step::LoadingWeights,
+            Measure::Bytes {
+                read: Arc::clone(&read),
+                total,
+            },
         );
 
         let tokenizer = Tokenizer::from_file(&tokenizer_file)
             .map_err(|e| anyhow!("loading {}: {e}", tokenizer_file.display()))?;
 
-        let mut talker = Talker::load(&config, &weights_file, dtype, &device)
+        let mut talker = Talker::load(&config, &weights_file, dtype, &device, &read)
             .map_err(|e| anyhow!("building the talker from {}: {e}", weights_file.display()))?;
         // Replay the forward passes as captured graphs instead of walking the
         // operations again per frame: one driver call per pass rather than a
@@ -765,9 +902,9 @@ impl QwenTts {
         // cloning reference into the codes an in-context example is made of.
         // Only they: it is weights and load time no other family would use.
         let mut speech_tokenizer = if kind == Kind::Base {
-            SpeechTokenizer::load_with_encoder(&st_config, &st_weights_file, &device)
+            SpeechTokenizer::load_with_encoder(&st_config, &st_weights_file, &device, &read)
         } else {
-            SpeechTokenizer::load(&st_config, &st_weights_file, &device)
+            SpeechTokenizer::load(&st_config, &st_weights_file, &device, &read)
         }
         .map_err(|e| anyhow!("building the codec from {}: {e}", st_weights_file.display()))?;
         // Where the talker computes in f16, which is Vulkan, so do the decoder's
@@ -816,7 +953,7 @@ impl QwenTts {
             speakers.len(),
             talker.supported_languages().len()
         );
-        let mut model = Self {
+        let model = Self {
             talker,
             speech_tokenizer,
             tokenizer,
@@ -832,7 +969,6 @@ impl QwenTts {
             device,
             dtype,
         };
-        model.warm_up();
         Ok(model)
     }
 
@@ -1157,7 +1293,11 @@ impl QwenTts {
     /// A failure here is logged and swallowed. The model is loaded and usable;
     /// refusing the load over a warm-up would turn a slow first request into no
     /// service at all.
-    fn warm_up(&mut self) {
+    ///
+    /// Counts the frames it generates into `frames`, which with the kernels it
+    /// compiles and tunes is how its progress is measured, and returns whether
+    /// it ran to the end.
+    fn warm_up(&mut self, frames: &AtomicU64) -> bool {
         // A Base checkpoint has no default voice to warm up with — it speaks
         // only in a voice that was registered — so one is invented here, from a
         // few seconds of synthetic sound, and released when the warm-up is
@@ -1178,21 +1318,23 @@ impl QwenTts {
                 Ok(()) => Some(WARM_UP_VOICE),
                 Err(e) => {
                     log::warn!("skipping the warm-up: {e:#}");
-                    return;
+                    return false;
                 }
             }
         } else {
             None
         };
-        self.warm_up_shapes(scratch);
+        let warmed = self.warm_up_shapes(scratch, frames);
         if let Some(voice) = scratch {
             self.forget_voice(voice);
         }
+        warmed
     }
 
     /// The warm-up itself, conditioned on `cloned` when the checkpoint needs a
-    /// voice to speak at all.
-    fn warm_up_shapes(&mut self, cloned: Option<&str>) {
+    /// voice to speak at all. Counts its frames into `frames` and returns
+    /// whether it ran to the end.
+    fn warm_up_shapes(&mut self, cloned: Option<&str>, frames: &AtomicU64) -> bool {
         let voice = match cloned {
             Some(uuid) => Requested::Cloned(uuid),
             None => Requested::Default,
@@ -1204,7 +1346,7 @@ impl QwenTts {
                 Ok(p) => p,
                 Err(e) => {
                     log::warn!("skipping the warm-up: {e}");
-                    return;
+                    return false;
                 }
             };
             // Stopped by the callback after one chunk rather than by a low
@@ -1212,14 +1354,15 @@ impl QwenTts {
             // token limit, so warming up under the real one tunes the kernels a
             // real request will use. One chunk is the shortest generation that
             // still reaches the decoder.
-            let mut frames = 0_usize;
+            let mut generated = 0_usize;
             let keep_going = || {
-                frames += 1;
-                frames <= STREAM_CHUNK_FRAMES
+                generated += 1;
+                frames.fetch_add(1, Ordering::Relaxed);
+                generated <= STREAM_CHUNK_FRAMES
             };
             if let Err(e) = self.generate(&prepared, MAX_NEW_TOKENS, keep_going, |_| true) {
                 log::warn!("the warm-up failed after {:.1?}: {e:#}", start.elapsed());
-                return;
+                return false;
             }
         }
         let ladder = start.elapsed();
@@ -1228,7 +1371,7 @@ impl QwenTts {
             WARM_UP_LENGTHS.len()
         );
         if ladder < DEEP_WARM_UP_THRESHOLD {
-            return;
+            return true;
         }
         // Cold. Generate far enough to outgrow the initial key/value cache, so
         // the doubling and the wider shapes it needs are tuned here rather than
@@ -1241,22 +1384,29 @@ impl QwenTts {
         let longest = WARM_UP_LENGTHS[WARM_UP_LENGTHS.len() - 1];
         let text: String = WARM_UP_TEXT.chars().take(longest).collect();
         let Ok(prepared) = self.prepare(&text, voice, None, Some("en"), None, None) else {
-            return;
+            return false;
         };
-        let mut frames = 0_usize;
+        let mut generated = 0_usize;
         let keep_going = || {
-            frames += 1;
-            frames <= DEEP_WARM_UP_FRAMES
+            generated += 1;
+            frames.fetch_add(1, Ordering::Relaxed);
+            generated <= DEEP_WARM_UP_FRAMES
         };
         let outcome = self.generate(&prepared, MAX_NEW_TOKENS, keep_going, |_| true);
         match outcome {
             // The frame count says which of the two ended it, and a count well
             // under the cap means this pass warmed nothing it was meant to.
-            Ok(_) => log::info!(
-                "warmed a long generation up in {:.1?}, {frames} frames",
-                deep.elapsed()
-            ),
-            Err(e) => log::warn!("the deep warm-up failed: {e:#}"),
+            Ok(_) => {
+                log::info!(
+                    "warmed a long generation up in {:.1?}, {generated} frames",
+                    deep.elapsed()
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!("the deep warm-up failed: {e:#}");
+                false
+            }
         }
     }
 
@@ -1696,8 +1846,13 @@ mod tests {
         let cfg: SpeechTokenizerConfig =
             serde_json::from_slice(&std::fs::read(codec_dir.join("config.json")).unwrap()).unwrap();
         let device = crate::qwen3::test_device();
-        let mut speech_tokenizer =
-            SpeechTokenizer::load(&cfg, &codec_dir.join("model.safetensors"), &device).unwrap();
+        let mut speech_tokenizer = SpeechTokenizer::load(
+            &cfg,
+            &codec_dir.join("model.safetensors"),
+            &device,
+            &Arc::default(),
+        )
+        .unwrap();
         let codes: Vec<u32> = std::fs::read(codes_file)
             .unwrap()
             .as_chunks::<4>()

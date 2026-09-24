@@ -24,6 +24,7 @@ mod lang;
 mod manifest_probe;
 mod model;
 mod model_thread;
+mod progress;
 mod prompt;
 mod qwen3;
 mod server;
@@ -97,7 +98,7 @@ fn export_kernels(backend_dir: &Path, args: &[String]) -> Result<()> {
         log::info!(
             "warming {model_name} to export its kernels; against an empty cache this is a cold load and takes minutes"
         );
-        let model = model::QwenTts::load(backend_dir, model_name, None)?;
+        let model = model::QwenTts::load(backend_dir, model_name, None, &|_| ())?;
         let device = model.device_name().to_string();
         // Dropped before the export so nothing is still writing to the cache.
         drop(model);
