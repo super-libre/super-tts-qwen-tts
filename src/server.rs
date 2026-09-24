@@ -146,7 +146,22 @@ async fn load(State(s): State<Arc<AppState>>, body: Option<Json<LoadRequest>>) -
     let device = req.device.clone();
 
     let queued = s.model.submit(move |slot| {
-        match QwenTts::load(&state.backend_dir, &name, device.as_deref()) {
+        // The old model goes first, so the two are never resident together.
+        *slot = None;
+        // Caught here as well as by the model thread, because only here can a
+        // panic still be reported as the failed load it is: left to the
+        // thread, the state would stay `loading` and the daemon would wait out
+        // its timeout for a load that ended long before.
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            QwenTts::load(&state.backend_dir, &name, device.as_deref())
+        }))
+        .unwrap_or_else(|panic| {
+            Err(anyhow::anyhow!(
+                "the load panicked: {}",
+                panic_message(&*panic)
+            ))
+        });
+        match loaded {
             Ok(model) => {
                 let device = model.device_name().to_string();
                 *slot = Some(model);
@@ -179,6 +194,15 @@ async fn load(State(s): State<Arc<AppState>>, body: Option<Json<LoadRequest>>) -
         Json(json!({ "status": "success", "message": "Loading started" })),
     )
         .into_response()
+}
+
+/// What a panic said, when it said it with a string, as `panic!` does.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 async fn cancel(State(s): State<Arc<AppState>>) -> Json<Value> {
@@ -677,6 +701,18 @@ mod tests {
         assert_eq!(body["status"], "success");
         assert_eq!(body["state"], "starting");
         assert!(body.get("model").is_none(), "no model has been asked for");
+    }
+
+    /// A load that panics reports what the panic said as its reason, from a
+    /// `panic!` with a literal message or with arguments alike.
+    #[test]
+    fn a_panicked_load_reports_what_the_panic_said() {
+        let reason = |run: fn()| {
+            let panic = std::panic::catch_unwind(run).expect_err("it panics");
+            panic_message(&*panic).to_string()
+        };
+        assert_eq!(reason(|| panic!("boom")), "boom");
+        assert_eq!(reason(|| panic!("{} {}", "formatted", 1)), "formatted 1");
     }
 
     /// The daemon gates synthesis on `ready`, but a race is still possible, and
