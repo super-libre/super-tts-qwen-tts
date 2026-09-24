@@ -68,10 +68,10 @@
 #
 # One build per (target, accelerator). There is no compute-capability axis:
 # Burn compiles every kernel at runtime through CubeCL — NVRTC on CUDA, hiprtc
-# on ROCm, MSL on Metal — so one CUDA build serves every NVIDIA generation
-# the installed driver can compile for, where an ahead-of-time build needs one
-# asset per SM. What is left is the CUDA major version, which decides the API
-# the binary was built against.
+# on ROCm, SPIR-V on Vulkan, MSL on Metal — so one CUDA build serves every
+# NVIDIA generation the installed driver can compile for, where an
+# ahead-of-time build needs one asset per SM. What is left is the CUDA major
+# version, which decides the API the binary was built against.
 
 [[assets.subprocess]]
     file = "qwen-tts-x86_64-unknown-linux-gnu-cpu.tar.gz"
@@ -113,10 +113,19 @@
         "gfx1201",
     ]
 
-# No Vulkan asset: the backend has no Vulkan build any more (see the README).
-# If it comes back, its floor is `vulkan_api = "1.2"`: the sampling kernel
-# reduces across a plane, and the subgroup types that needs are core in Vulkan
-# 1.2 (CubeCL reaches for `VK_KHR_shader_subgroup_extended_types` below it).
+# The vendor-neutral GPU path: Intel, an AMD card on the Mesa driver, an NVIDIA
+# card without CUDA installed. Ranked below the native backends by the daemon,
+# but it is the only GPU some hosts have. It computes in f16 where the device
+# has it and in f32 elsewhere, never in bf16 (see the README).
+#
+# The 1.2 floor is the sampling kernel's: it reduces across a plane, and the
+# subgroup types that needs are core in Vulkan 1.2 (CubeCL reaches for
+# `VK_KHR_shader_subgroup_extended_types` below it).
+[[assets.subprocess]]
+    file = "qwen-tts-x86_64-unknown-linux-gnu-vulkan.tar.gz"
+    target = "x86_64-unknown-linux-gnu"
+    accel = "vulkan"
+    vulkan_api = "1.2"
 
 [[assets.subprocess]]
     file = "qwen-tts-aarch64-unknown-linux-gnu-cpu.tar.gz"

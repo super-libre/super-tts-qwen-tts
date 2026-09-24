@@ -22,8 +22,8 @@ with framed PCM.
 
 Burn is what makes this the widest-reaching backend here. Its kernels are
 compiled at runtime by CubeCL, so one binary per accelerator covers every GPU
-generation the driver can compile for — and the accelerators include ROCm,
-which the candle-based backends cannot reach at all.
+generation the driver can compile for — and the accelerators include ROCm and
+Vulkan, which the candle-based backends cannot reach at all.
 
 Synthesis has two halves, and the split is why speech starts before the
 utterance is finished:
@@ -187,20 +187,30 @@ first audio 0.3 seconds into a request and synthesizes at about 6x real time —
 19 seconds of speech in 3.2. On a CPU it is slower than real time; the 0.6B
 model is the one to try without a GPU.
 
-Releases ship seven builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
-12 and CUDA 13, and ROCm. On Apple Silicon Macs: a CPU build and Metal. The
-daemon picks the one matching the machine, and ranks a GPU backend above the
-CPU. There is no compute-capability axis — see the manifest for why.
+Releases ship eight builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
+12 and CUDA 13, ROCm, and Vulkan. On Apple Silicon Macs: a CPU build and Metal.
+The daemon picks the one matching the machine, and ranks a native backend above
+Vulkan above the CPU. There is no compute-capability axis — see the manifest
+for why.
 
-There is no Vulkan build. Burn can target it, and it was tried on an RTX 3090
-with NVIDIA's 610.57.04 driver. The talker runs in bf16 on a GPU, and CubeCL's
-SPIR-V backend emits bf16 arithmetic, which `SPV_KHR_bfloat16` does not allow:
-bf16 there is for conversions, dot products and cooperative matrices only. The
-shaders are invalid on any Vulkan driver; NVIDIA's segfaults compiling them
-rather than rejecting them. In f16 the model never stops talking. In f32 it runs, but only with graph capture off,
-because the captured pass does a host-to-device write that a wgpu capture
-cannot record, and eagerly it manages about 0.4× real time on either model
-size. The commit that removed it records what bringing it back would take.
+On Vulkan the talker computes in f16, not the bf16 of CUDA and ROCm. CubeCL's
+SPIR-V backend emits bf16 arithmetic, which `SPV_KHR_bfloat16` does not allow —
+bf16 there is for conversions, dot products and cooperative matrices only — so
+those shaders are invalid on any Vulkan driver, and NVIDIA's segfaults compiling
+them rather than rejecting them. f16 holds the model: the largest value in a
+1.7B prefill is 9.6e3, against the 6.5e4 f16 reaches. A device without f16 gets
+f32. The codec decoder's convolutions run in f16 there too, with everything
+around them in f32: a Vulkan device computes f32 convolutions without its matrix
+units, and on an RTX 3090 that left the codec alone slower than real time, 2.9
+seconds of decoding for every 2 of audio. In f16 they take 0.1 seconds. f16 has
+the 10-bit mantissa of the TF32 that CUDA runs them at, and the decoded audio
+stays 52 to 65 dB from an f32 decode, around 60, where the decoder's own noise
+is 65.
+
+Measured on the RTX 3090 with NVIDIA's 610.57.04 driver, the 1.7B CustomVoice
+model on Vulkan synthesizes at 3.0 to 3.5x real time, against 3.7 to 4.2x on
+CUDA, and loads in 71 seconds from an empty cache. The kernel bundle has no
+Vulkan entries yet, so that is every first load.
 
 Weights are downloaded by the daemon before the first load. This process has no
 network at all — it runs with `PrivateNetwork=yes` and a read-only backend
@@ -370,6 +380,7 @@ git clone https://github.com/super-libre/super-tts-qwen-tts
 just build-release          # the pure-Rust CPU backend
 just build-cuda             # needs the CUDA headers — no GPU, no compute capability
 just build-rocm             # needs the ROCm headers
+just build-vulkan           # needs nothing; the loader is found at runtime
 just build-metal            # macOS; needs nothing beyond Xcode's SDK
 ```
 

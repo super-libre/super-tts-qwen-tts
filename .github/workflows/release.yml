@@ -132,10 +132,18 @@ jobs:
               image: "rocm/dev-ubuntu-22.04:7.1.1",
             }
 
-          # No Vulkan build: the backend has none (see the README).
+          # Vulkan: no SDK needed to build, the loader is found at runtime.
+          - {
+              os: ubuntu-22.04,
+              target: x86_64-unknown-linux-gnu,
+              suffix: vulkan,
+              features: vulkan,
+              image: "",
+            }
 
           # CPU (aarch64), built natively on an arm64 runner. No CUDA or ROCm
-          # on ARM here.
+          # on ARM here, and Vulkan is left out until there is a runner to test
+          # it on.
           - {
               os: ubuntu-22.04-arm,
               target: aarch64-unknown-linux-gnu,
