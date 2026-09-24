@@ -102,12 +102,17 @@
     # `ServiceExt::oneshot` for in-process router tests.
     tower = { version = "0.5", features = ["util"] }
 
-# One accelerator per build, as the asset it ships in declares. `flex` is the
-# default because it is the one that runs anywhere: a pure-Rust CPU backend
-# with nothing to detect and no driver to find.
+# One accelerator per build, as the asset it ships in declares, and every one
+# of them a GPU: the models are too big for a CPU to run at a useful speed, the
+# 1.7B talker generating about one frame of audio every ten seconds. `vulkan`
+# is the default because it is the one that builds anywhere: no SDK, and the
+# loader is found at runtime.
+#
+# `flex`, a pure-Rust CPU backend, is not shipped and not a way to run the
+# model. It is what the tests run on, so that CI checks the transformer, the
+# codec and the sampler without a GPU; `just test` selects it.
 [features]
-    default = ["flex"]
-    cpu = ["burn/cpu"]
+    default = ["vulkan"]
     cuda = ["burn/cuda"]
     flex = ["burn/flex"]
     metal = ["burn/metal"]

@@ -11,7 +11,9 @@
 #
 # Every recipe that builds passes `--no-default-features` with one accelerator
 # named, matching the release workflow: features are additive, so a build that
-# kept the default `flex` alongside `cuda` would carry two backends.
+# kept the default `vulkan` alongside `cuda` would carry two backends. Every one
+# is a GPU build; the recipes that test pass `flex` instead, a CPU backend that
+# exists only so the suite runs without a GPU.
 
 tokenizer_url := "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json"
 tokenizer_dir := justfile_directory() / "target/test-backend"
@@ -23,7 +25,7 @@ default: build-release
 build-debug *args:
     cargo build {{ args }}
 
-# Compiles with release profile — the pure-Rust CPU backend.
+# Compiles with release profile — Vulkan, the default.
 # Usage: just build-release [args]
 build-release *args:
     cargo build --release --locked {{ args }}
@@ -69,9 +71,11 @@ clean:
 clean-all: clean
     rm -f super-tts-backend-qwen-tts lcov.info *.profraw *.profdata
 
-# Runs a clippy check — mirrors super-tts's lint.
+# Runs a clippy check — mirrors super-tts's lint. Twice: the default Vulkan
+# build, and the `flex` one the tests run on, whose device arm only it compiles.
 check *args:
     cargo clippy --all-targets {{ args }} -- -W clippy::pedantic -D warnings -D unused_must_use
+    cargo clippy --all-targets --no-default-features --features flex {{ args }} -- -W clippy::pedantic -D warnings -D unused_must_use
 
 # Runs a clippy check with JSON message format (consumed by clippy-sarif in CI)
 check-json: (check '--message-format=json')
@@ -91,7 +95,7 @@ fmt-check:
 #
 # Run the test suite. Usage: just test [--verbose]
 test *args:
-    cargo test --locked {{ args }}
+    cargo test --locked --no-default-features --features flex {{ args }}
 
 # The daemon fetches this file in production; it is 11 MB and deliberately not
 # in the repository.
@@ -109,7 +113,7 @@ fetch-tokenizer:
 
 # Run the whole suite including the reference tokenization fixture.
 test-tokenizer *args: fetch-tokenizer
-    cargo test --locked {{ args }}
+    cargo test --locked --no-default-features --features flex {{ args }}
 
 # cross-rs builds inside a container, so no local CUDA or C toolchain is needed.
 #
@@ -122,12 +126,12 @@ cross-build target="x86_64-unknown-linux-gnu":
 #
 # Measure coverage, requires cargo-llvm-cov. Usage: just coverage [--html]
 coverage *args:
-    cargo llvm-cov --locked --remap-path-prefix --ignore-filename-regex 'tests/' {{ args }}
+    cargo llvm-cov --locked --no-default-features --features flex --remap-path-prefix --ignore-filename-regex 'tests/' {{ args }}
 
 # Coverage for CI: write lcov.info and print a summary.
 coverage-lcov:
-    cargo llvm-cov --locked --remap-path-prefix --ignore-filename-regex 'tests/' --lcov --output-path lcov.info
-    cargo llvm-cov report --summary-only --ignore-filename-regex 'tests/'
+    cargo llvm-cov --locked --no-default-features --features flex --remap-path-prefix --ignore-filename-regex 'tests/' --lcov --output-path lcov.info
+    cargo llvm-cov report --no-default-features --features flex --summary-only --ignore-filename-regex 'tests/'
 
 # No doctests: this is a binary-only crate, so `cargo test --doc` has no lib
 # target.

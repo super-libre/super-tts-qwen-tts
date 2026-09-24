@@ -66,17 +66,13 @@
 # assets and pins their hashes. The archives hold the binary at their root,
 # which is where `entrypoint` above says to find it.
 #
-# One build per (target, accelerator). There is no compute-capability axis:
-# Burn compiles every kernel at runtime through CubeCL — NVRTC on CUDA, hiprtc
-# on ROCm, SPIR-V on Vulkan, MSL on Metal — so one CUDA build serves every
-# NVIDIA generation the installed driver can compile for, where an
-# ahead-of-time build needs one asset per SM. What is left is the CUDA major
-# version, which decides the API the binary was built against.
-
-[[assets.subprocess]]
-    file = "qwen-tts-x86_64-unknown-linux-gnu-cpu.tar.gz"
-    target = "x86_64-unknown-linux-gnu"
-    accel = "cpu"
+# One build per (target, accelerator), and every one a GPU build: the models
+# are too big for a CPU to run at a useful speed. There is no
+# compute-capability axis: Burn compiles every kernel at runtime through
+# CubeCL — NVRTC on CUDA, LLVM on ROCm, SPIR-V on Vulkan, MSL on Metal — so one
+# CUDA build serves every NVIDIA generation the installed driver can compile
+# for, where an ahead-of-time build needs one asset per SM. What is left is the
+# CUDA major version, which decides the API the binary was built against.
 
 [[assets.subprocess]]
     file = "qwen-tts-x86_64-unknown-linux-gnu-cuda12.tar.gz"
@@ -127,18 +123,8 @@
     accel = "vulkan"
     vulkan_api = "1.2"
 
-[[assets.subprocess]]
-    file = "qwen-tts-aarch64-unknown-linux-gnu-cpu.tar.gz"
-    target = "aarch64-unknown-linux-gnu"
-    accel = "cpu"
-
 # macOS on Apple Silicon. Metal compiles its kernels at runtime like the other
 # GPU builds, so it has nothing to select on beyond the target.
-[[assets.subprocess]]
-    file = "qwen-tts-aarch64-apple-darwin-cpu.tar.gz"
-    target = "aarch64-apple-darwin"
-    accel = "cpu"
-
 [[assets.subprocess]]
     file = "qwen-tts-aarch64-apple-darwin-metal.tar.gz"
     target = "aarch64-apple-darwin"
@@ -159,7 +145,7 @@
     # Beijing and Sichuan dialects are not listed: the reference implementation
     # selects them through the speaker (`dylan`, `eric`), not the language.
     supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
-    supported_devices = ["cpu", "gpu"]
+    supported_devices = ["gpu"]
     # The weights (1.8 GB) plus the codec (0.7 GB) in bf16, with room for the
     # KV cache of a long utterance. Deliberately conservative: the daemon uses
     # this to decide whether a GPU can hold the model at all.
@@ -249,7 +235,7 @@
     multilingual = true
     primary_language = "en"
     supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
-    supported_devices = ["cpu", "gpu"]
+    supported_devices = ["gpu"]
     # 3.8 GB of weights plus the 0.7 GB codec, in bf16, with KV-cache headroom.
     estimated_vram_bytes = 6442450944
     max_input_chars = 500
@@ -330,7 +316,7 @@
     multilingual = true
     primary_language = "en"
     supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
-    supported_devices = ["cpu", "gpu"]
+    supported_devices = ["gpu"]
     estimated_vram_bytes = 6442450944
     max_input_chars = 500
     output_sample_rate = 24000
@@ -451,7 +437,7 @@
     multilingual = true
     primary_language = "en"
     supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
-    supported_devices = ["cpu", "gpu"]
+    supported_devices = ["gpu"]
     # Same weights as the CustomVoice checkpoint of this size, plus the codec's
     # encoder and the speaker encoder — both small next to the talker.
     estimated_vram_bytes = 3758096384
@@ -480,7 +466,7 @@
     multilingual = true
     primary_language = "en"
     supported_languages = ["de", "en", "es", "fr", "it", "ja", "ko", "pt", "ru", "zh"]
-    supported_devices = ["cpu", "gpu"]
+    supported_devices = ["gpu"]
     # 3.8 GB of weights plus the 0.7 GB codec, in bf16, with KV-cache headroom.
     estimated_vram_bytes = 6442450944
     max_input_chars = 500

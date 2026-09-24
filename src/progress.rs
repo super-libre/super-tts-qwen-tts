@@ -259,8 +259,8 @@ mod tests {
         assert!(measure.fraction() < 1.0);
     }
 
-    /// A build without a kernel cache to fill — the `flex` CPU backend — still
-    /// moves, on the frames alone.
+    /// A warm-up that writes nothing to the kernel cache, as a warm load's
+    /// does, still moves, on the frames alone.
     #[test]
     fn a_warm_up_moves_with_its_frames() {
         let frames = Arc::new(AtomicU64::new(0));

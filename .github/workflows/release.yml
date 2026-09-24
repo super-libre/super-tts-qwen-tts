@@ -23,9 +23,10 @@ jobs:
           # runtime, so there is no compute-capability axis: what used to be
           # twelve CUDA builds is two, one per CUDA major version.
           #
-          # `features` is passed with `--no-default-features`, so each build
-          # carries exactly one backend rather than its own plus the default
-          # `flex`.
+          # Every build is a GPU build: the models are too big for a CPU to run
+          # at a useful speed. `features` is passed with `--no-default-features`,
+          # so each build carries exactly one backend rather than its own plus
+          # the default `vulkan`.
           #
           # Every Linux build links against Ubuntu 22.04's glibc, 2.35, so
           # every asset starts on the same hosts. A build with an `image` runs
@@ -35,16 +36,6 @@ jobs:
           # up that glibc's version, so a binary that spawns a process at all
           # demands 2.39 and will not start on 22.04 or Debian 12. macOS
           # builds natively too: cross has no Apple SDK to offer.
-
-          # CPU (x86_64) — the pure-Rust backend, which runs anywhere. Usable,
-          # but the talker is a transformer: expect slower than real time.
-          - {
-              os: ubuntu-22.04,
-              target: x86_64-unknown-linux-gnu,
-              suffix: cpu,
-              features: flex,
-              image: "",
-            }
 
           # CUDA. Built inside the nvidia/cuda devel image via cross's image
           # override: `cudarc` asks `nvcc --version` which CUDA API to bind, so
@@ -93,28 +84,8 @@ jobs:
               image: "",
             }
 
-          # CPU (aarch64), built natively on an arm64 runner. No CUDA or ROCm
-          # on ARM here, and Vulkan is left out until there is a runner to test
-          # it on.
-          - {
-              os: ubuntu-22.04-arm,
-              target: aarch64-unknown-linux-gnu,
-              suffix: cpu,
-              features: flex,
-              image: "",
-            }
-
-          # macOS, Apple Silicon only: macOS 26 is the last release for Intel
-          # Macs. The CPU build is the same `flex` as on Linux.
-          - {
-              os: macos-latest,
-              target: aarch64-apple-darwin,
-              suffix: cpu,
-              features: flex,
-              image: "",
-            }
-
-          # Metal. Nothing to install: wgpu reaches Metal through the system
+          # Metal, on Apple Silicon only: macOS 26 is the last release for Intel
+          # Macs. Nothing to install: wgpu reaches Metal through the system
           # framework, and CubeCL compiles its kernels to MSL at runtime, so
           # as with CUDA there is no per-GPU axis.
           - {

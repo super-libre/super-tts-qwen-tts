@@ -71,8 +71,7 @@ pub mod sampling;
     feature = "rocm",
     feature = "metal",
     feature = "vulkan",
-    feature = "wgpu",
-    feature = "cpu"
+    feature = "wgpu"
 ))]
 pub mod sampling_kernel;
 pub mod speaker_encoder;

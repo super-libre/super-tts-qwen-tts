@@ -180,18 +180,17 @@ template that has moved.
 
 ## Requirements
 
-A GPU is not required but is strongly recommended. The talker is a transformer
-generating 12.5 frames per second of speech. Measured on an RTX 3090 with a
-warm kernel cache, the 0.6B CustomVoice model loads in 3 seconds, sends its
-first audio 0.3 seconds into a request and synthesizes at about 6x real time —
-19 seconds of speech in 3.2. On a CPU it is slower than real time; the 0.6B
-model is the one to try without a GPU.
+A GPU is required. The talker is a transformer generating 12.5 frames per
+second of speech. Measured on an RTX 3090 with a warm kernel cache, the 0.6B
+CustomVoice model loads in 3 seconds, sends its first audio 0.3 seconds into a
+request and synthesizes at about 6x real time — 19 seconds of speech in 3.2. A
+CPU is nowhere near that: the 1.7B talker generated about one frame every ten
+seconds on one, so there is no CPU build.
 
-Releases ship eight builds. On Linux: a CPU build for x86_64 and aarch64, CUDA
-12 and CUDA 13, ROCm, and Vulkan. On Apple Silicon Macs: a CPU build and Metal.
-The daemon picks the one matching the machine, and ranks a native backend above
-Vulkan above the CPU. There is no compute-capability axis — see the manifest
-for why.
+Releases ship five builds. On Linux: CUDA 12 and CUDA 13, ROCm, and Vulkan. On
+Apple Silicon Macs: Metal. The daemon picks the one matching the machine, and
+ranks a native backend above Vulkan. There is no compute-capability axis — see
+the manifest for why.
 
 Only CUDA computes the talker in bf16, the type the checkpoints were trained in;
 every other GPU gets f16, because CubeCL cannot compile bf16 there. On Vulkan
@@ -294,10 +293,10 @@ without either moving was 4.7 seconds on CUDA and 1.6 on Vulkan.
 
 ```sh
 git clone https://github.com/super-libre/super-tts-qwen-tts
-just build-release          # the pure-Rust CPU backend
+just build-release          # Vulkan, the default: needs nothing to build
 just build-cuda             # needs the CUDA headers — no GPU, no compute capability
 just build-rocm             # needs the ROCm headers
-just build-vulkan           # needs nothing; the loader is found at runtime
+just build-vulkan           # the same as build-release
 just build-metal            # macOS; needs nothing beyond Xcode's SDK
 ```
 
@@ -306,12 +305,14 @@ because Burn is a git dependency and has to be fetched and compiled.
 
 Each build carries exactly one accelerator, which is why the recipes pass
 `--no-default-features`. Cargo features are additive, so `--features cuda` on
-its own would keep the default `flex` backend too and link both.
+its own would keep the default `vulkan` backend too and link both.
 
-`just test` runs the suite. One test tokenizes the chat template and compares
-against ids produced by the reference `onig` tokenizer; it skips unless
-`tokenizer.json` is present, so `just test-tokenizer` fetches it once and runs
-everything. `just ci` is the full local gate.
+`just test` runs the suite, on `flex`, a pure-Rust CPU backend that exists only
+for it: CI has no GPU, and this way the transformer, the codec and the sampler
+are still exercised there. It is not a way to run the model. One test tokenizes
+the chat template and compares against ids produced by the reference `onig`
+tokenizer; it skips unless `tokenizer.json` is present, so `just test-tokenizer`
+fetches it once and runs everything. `just ci` is the full local gate.
 
 **Burn comes from a fork.** `Cargo.toml` pins `jorge-menjivar/burn` at
 `e7897a65`, which is upstream Burn plus six fixes to `burn-cubecl-fusion` the

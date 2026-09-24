@@ -454,22 +454,15 @@ const ON_GPU: bool = cfg!(any(
 ));
 
 /// Whether this build compiles its kernels at runtime, through `CubeCL`,
-/// which is what makes a first load an initial setup. The `flex` CPU backend
-/// does not.
-const BUILDS_KERNELS: bool = cfg!(any(
-    feature = "cuda",
-    feature = "rocm",
-    feature = "vulkan",
-    feature = "metal",
-    feature = "wgpu",
-    feature = "cpu"
-));
+/// which is what makes a first load an initial setup. Every GPU build does;
+/// the `flex` CPU backend the tests run on does not.
+const BUILDS_KERNELS: bool = ON_GPU;
 
 /// The entries a first load's warm-up writes to the kernel cache, tuning
 /// results and compiled kernels both: 1754 on CUDA and 726 on Vulkan, measured
 /// on an empty cache with the 1.7B CustomVoice checkpoint on an RTX 3090. ROCm
-/// and `CubeCL`'s CPU backend are taken to be CUDA, Metal and the generic
-/// `wgpu` to be Vulkan, unmeasured. Only the pace of the bar rides on it: past
+/// is taken to be CUDA, and Metal and the generic `wgpu` to be Vulkan,
+/// unmeasured. Only the pace of the bar rides on it: past
 /// the estimate it slows down short of the end rather than stopping, see
 /// `progress::estimate`, and a checkpoint that writes fewer ends its step
 /// early.
@@ -485,8 +478,8 @@ const WARM_UP_CACHE_ENTRIES: u64 = if !BUILDS_KERNELS {
 /// its progress is measured against: the entries it writes to the kernel
 /// cache, and one per frame it generates — every rung of the ladder, and on
 /// an initial setup the deep pass after it, both counted as far as their
-/// caps. Frames are what keep a warm load's bar, and a build without a kernel
-/// cache, moving.
+/// caps. Frames are what keep a warm load's bar moving, since it finds every
+/// kernel cached.
 fn warm_up_work(phase: Phase) -> u64 {
     let ladder = WARM_UP_LENGTHS.len() * (STREAM_CHUNK_FRAMES + 1);
     match phase {
@@ -575,38 +568,28 @@ fn select_device(requested: Option<&str>) -> (Device, &'static str) {
         Device::wgpu(burn::prelude::DeviceKind::DefaultDevice),
         "wgpu",
     );
-    // Both CPU backends report `cpu`: they are one accelerator as far as the
-    // manifest and the daemon are concerned, and which one a build carries is
-    // a build decision rather than something the host can act on.
+    // The backend the tests run on, which no release carries.
     #[cfg(all(
         not(feature = "cuda"),
         not(feature = "rocm"),
         not(feature = "vulkan"),
         not(feature = "metal"),
         not(feature = "wgpu"),
-        feature = "cpu"
-    ))]
-    return (Device::cpu(), "cpu");
-    #[cfg(all(
-        not(feature = "cuda"),
-        not(feature = "rocm"),
-        not(feature = "vulkan"),
-        not(feature = "metal"),
-        not(feature = "wgpu"),
-        not(feature = "cpu"),
         feature = "flex"
     ))]
     return (Device::flex(), "cpu");
-    #[cfg(all(
-        not(feature = "cuda"),
-        not(feature = "rocm"),
-        not(feature = "vulkan"),
-        not(feature = "metal"),
-        not(feature = "wgpu"),
-        not(feature = "cpu"),
-        not(feature = "flex")
-    ))]
-    (Device::default(), "cpu")
+    #[cfg(not(any(
+        feature = "cuda",
+        feature = "rocm",
+        feature = "vulkan",
+        feature = "metal",
+        feature = "wgpu",
+        feature = "flex"
+    )))]
+    compile_error!(
+        "build with one accelerator: `--features cuda`, `rocm`, `vulkan` or `metal` \
+         (`flex` is the tests' CPU backend)"
+    );
 }
 
 /// Point `CubeCL`'s kernel cache at the directory the daemon granted.
@@ -2012,7 +1995,7 @@ mod tests {
     #[test]
     fn the_reported_accelerator_matches_the_compiled_backend() {
         let (_, name) = select_device(None);
-        // `flex` and `cpu` are two CPU backends and both report "cpu".
+        // `flex`, the tests' CPU backend, reports "cpu".
         assert_eq!(name, BUILT_FOR);
         assert_eq!(ON_GPU, BUILT_FOR != "cpu");
     }
