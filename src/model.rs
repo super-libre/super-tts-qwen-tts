@@ -499,20 +499,24 @@ fn warm_up_work(phase: Phase) -> u64 {
 /// A half-width type halves the talker's weights and its bandwidth on a GPU.
 /// On the CPU it is slower than f32 rather than faster.
 ///
-/// bf16 is what the checkpoints were trained in and what CUDA and ROCm get.
-/// Never on Vulkan, whatever the device reports: the SPIR-V extension for bf16
-/// allows no arithmetic on it, yet CubeCL emits some, and NVIDIA's driver
-/// crashes compiling it. Vulkan, and the generic `wgpu` backend, which is
-/// Vulkan on Linux, get f16 instead. It holds the talker: the largest value
-/// of a 1.7B prefill, the product inside the MLP of its third layer, is
-/// 9.6e3 of the 6.5e4 f16 reaches, and the speech ends where it should. A
-/// device that computes in neither type gets f32, which is Metal's case:
-/// CubeCL's Metal backend reports no bf16.
+/// bf16 is what the checkpoints were trained in, and CUDA gets it. Nothing
+/// else does, whatever the device reports, because CubeCL cannot compile it
+/// there. On Vulkan the SPIR-V extension for bf16 allows no arithmetic on it,
+/// yet CubeCL emits some, and NVIDIA's driver crashes compiling it. On ROCm
+/// CubeCL compiles through LLVM, and its lowering has no bf16 type at all: an
+/// RDNA1 card that reports bf16 failed every kernel with "Type cube.bf16 does
+/// not have a conversion to LLVM type implemented", and nothing in the
+/// lowering depends on the card. Metal's backend reports no bf16.
+///
+/// Those get f16 instead. It holds the talker: the largest value of a 1.7B
+/// prefill, the product inside the MLP of its third layer, is 9.6e3 of the
+/// 6.5e4 f16 reaches, and on Vulkan the speech ends where it should. A device
+/// that computes in neither type gets f32.
 fn talker_dtype(device: &Device) -> DType {
-    let half = if matches!(BUILT_FOR, "vulkan" | "wgpu") {
-        DType::F16
-    } else {
+    let half = if BUILT_FOR == "cuda" {
         DType::BF16
+    } else {
+        DType::F16
     };
     if ON_GPU && device.supports_dtype(half) {
         half
@@ -907,10 +911,10 @@ impl QwenTts {
             SpeechTokenizer::load(&st_config, &st_weights_file, &device, &read)
         }
         .map_err(|e| anyhow!("building the codec from {}: {e}", st_weights_file.display()))?;
-        // Where the talker computes in f16, which is Vulkan, so do the decoder's
-        // convolutions, or the codec alone runs slower than real time. See
+        // On Vulkan the decoder's convolutions run in f16 as the talker does,
+        // or the codec alone runs slower than real time. See
         // `SpeechTokenizer::convolve_in` for what that costs.
-        if dtype == DType::F16 {
+        if matches!(BUILT_FOR, "vulkan" | "wgpu") && dtype == DType::F16 {
             speech_tokenizer.convolve_in(DType::F16);
         }
         // A Base checkpoint whose weights carry no speaker encoder can still

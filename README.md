@@ -193,19 +193,21 @@ The daemon picks the one matching the machine, and ranks a native backend above
 Vulkan above the CPU. There is no compute-capability axis — see the manifest
 for why.
 
-On Vulkan the talker computes in f16, not the bf16 of CUDA and ROCm. CubeCL's
-SPIR-V backend emits bf16 arithmetic, which `SPV_KHR_bfloat16` does not allow —
-bf16 there is for conversions, dot products and cooperative matrices only — so
-those shaders are invalid on any Vulkan driver, and NVIDIA's segfaults compiling
-them rather than rejecting them. f16 holds the model: the largest value in a
-1.7B prefill is 9.6e3, against the 6.5e4 f16 reaches. A device without f16 gets
-f32. The codec decoder's convolutions run in f16 there too, with everything
-around them in f32: a Vulkan device computes f32 convolutions without its matrix
-units, and on an RTX 3090 that left the codec alone slower than real time, 2.9
-seconds of decoding for every 2 of audio. In f16 they take 0.1 seconds. f16 has
-the 10-bit mantissa of the TF32 that CUDA runs them at, and the decoded audio
-stays 52 to 65 dB from an f32 decode, around 60, where the decoder's own noise
-is 65.
+Only CUDA computes the talker in bf16, the type the checkpoints were trained in;
+every other GPU gets f16, because CubeCL cannot compile bf16 there. On Vulkan
+its SPIR-V backend emits bf16 arithmetic, which `SPV_KHR_bfloat16` does not
+allow — bf16 there is for conversions, dot products and cooperative matrices
+only — so those shaders are invalid on any Vulkan driver, and NVIDIA's segfaults
+compiling them rather than rejecting them. On ROCm it compiles through LLVM,
+whose lowering has no bf16 type at all, and Metal's backend reports none. f16
+holds the model: the largest value in a 1.7B prefill is 9.6e3, against the 6.5e4
+f16 reaches. A device without f16 gets f32. On Vulkan the codec decoder's
+convolutions run in f16 too, with everything around them in f32: a Vulkan device
+computes f32 convolutions without its matrix units, and on an RTX 3090 that left
+the codec alone slower than real time, 2.9 seconds of decoding for every 2 of
+audio. In f16 they take 0.1 seconds. f16 has the 10-bit mantissa of the TF32
+that CUDA runs them at, and the decoded audio stays 52 to 65 dB from an f32
+decode, around 60, where the decoder's own noise is 65.
 
 Measured on the RTX 3090 with NVIDIA's 610.57.04 driver, the 1.7B CustomVoice
 model on Vulkan synthesizes at 3.0 to 3.5x real time, against 3.7 to 4.2x on
