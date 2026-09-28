@@ -478,8 +478,8 @@ impl Vocoder {
         for block in self.blocks.iter() {
             wav = block.forward(wav);
         }
-        let wav = self.final_conv.forward(self.final_act.forward(wav));
-        wav.clamp(-1., 1.)
+        // Unclamped: the decoder clamps, see [`Decoder::forward`].
+        self.final_conv.forward(self.final_act.forward(wav))
     }
 }
 
@@ -625,10 +625,11 @@ impl Decoder {
         let hidden = self.pre_conv.forward(hidden).swap_dims(1, 2);
         let hidden = self.pre_transformer.forward(hidden, state);
         self.after_transformer(hidden.swap_dims(1, 2))
+            .clamp(-1., 1.)
     }
 
     /// The stack after the transformer: latents (B, latent_dim, T) to audio (B, 1, T *
-    /// total_upsample).
+    /// total_upsample), before [`Self::forward`] clamps it.
     fn after_transformer(&self, mut hidden: Tensor<3>) -> Tensor<3> {
         for stage in self.upsample.iter() {
             hidden = stage.convnext.forward(stage.conv.forward(hidden));
@@ -1474,6 +1475,10 @@ mod tests {
     /// convolutions themselves. A frame of latents is replaced and the audio compared: past the
     /// counted reach nothing may move at all — those samples are computed from the same inputs
     /// by the same kernels, so the comparison is exact, not a tolerance.
+    ///
+    /// Compared before the clamp: a random decoder can saturate it, at -1 everywhere, where no
+    /// frame moves anything and the check that the kick landed failed. Being pointwise, the
+    /// clamp reaches no further than the stack before it.
     #[test]
     fn nothing_past_the_counted_reach_depends_on_a_frame() {
         let device = crate::qwen3::test_device();
