@@ -131,7 +131,7 @@ coverage *args:
 # Coverage for CI: write lcov.info and print a summary.
 coverage-lcov:
     cargo llvm-cov --locked --no-default-features --features flex --remap-path-prefix --ignore-filename-regex 'tests/' --lcov --output-path lcov.info
-    cargo llvm-cov report --no-default-features --features flex --summary-only --ignore-filename-regex 'tests/'
+    cargo llvm-cov report --summary-only --ignore-filename-regex 'tests/'
 
 # No doctests: this is a binary-only crate, so `cargo test --doc` has no lib
 # target.
