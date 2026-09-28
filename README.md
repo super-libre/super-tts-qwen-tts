@@ -283,8 +283,8 @@ the kernels, written once a warm-up runs to the end, tells them apart, so
 clearing the cache makes the next load an initial setup again. `step` is
 `loading_weights`, measured by the bytes of the checkpoints read, then
 `building_kernels` on an initial setup or `warming_up` after. The warm-up is
-measured by the entries CubeCL writes to the cache — 1754 of them on CUDA and
-726 on Vulkan from empty — plus one per frame it generates, which is what keeps
+measured by the entries CubeCL writes to the cache — 1730 of them on CUDA and
+724 on Vulkan from empty — plus one per frame it generates, which is what keeps
 the bar moving where nothing is compiled. The daemon fails a load whose step and
 progress stand still for two minutes; on the RTX 3090 the longest stretch
 without either moving was 4.7 seconds on CUDA and 1.6 on Vulkan.

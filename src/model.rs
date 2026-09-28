@@ -459,7 +459,7 @@ const ON_GPU: bool = cfg!(any(
 const BUILDS_KERNELS: bool = ON_GPU;
 
 /// The entries a first load's warm-up writes to the kernel cache, tuning
-/// results and compiled kernels both: 1754 on CUDA and 726 on Vulkan, measured
+/// results and compiled kernels both: 1730 on CUDA and 724 on Vulkan, measured
 /// on an empty cache with the 1.7B CustomVoice checkpoint on an RTX 3090. ROCm
 /// is taken to be CUDA, and Metal and the generic `wgpu` to be Vulkan,
 /// unmeasured. Only the pace of the bar rides on it: past
@@ -469,9 +469,9 @@ const BUILDS_KERNELS: bool = ON_GPU;
 const WARM_UP_CACHE_ENTRIES: u64 = if !BUILDS_KERNELS {
     0
 } else if cfg!(any(feature = "vulkan", feature = "metal", feature = "wgpu")) {
-    726
+    724
 } else {
-    1754
+    1730
 };
 
 /// The units of work a warm-up in `phase` is expected to do, which is what

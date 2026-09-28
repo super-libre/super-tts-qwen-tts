@@ -836,13 +836,13 @@ impl EncoderLayer {
     fn forward(
         &self,
         xs: Tensor<3>,
-        mask: Option<&Tensor<4, Bool>>,
+        bias: Option<&Tensor<4>>,
         rotary: &RotarySlice,
         cache: &mut KvCache,
     ) -> Tensor<3> {
         let hidden = self.self_attn.forward(
             self.input_layernorm.forward(xs.clone()),
-            mask,
+            bias,
             rotary,
             cache,
             Step::Static { offset: 0 },
@@ -878,9 +878,9 @@ impl EncoderTransformer {
         state.reset();
         let mut xs = xs.swap_dims(1, 2);
         let seq_len = xs.dims()[1];
-        let (mask, rotary, caches) = state.step(seq_len, 0);
+        let (bias, rotary, caches) = state.step(seq_len, 0);
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            xs = layer.forward(xs, mask.as_ref(), &rotary, cache);
+            xs = layer.forward(xs, bias.as_ref(), &rotary, cache);
         }
         xs.swap_dims(1, 2)
     }
