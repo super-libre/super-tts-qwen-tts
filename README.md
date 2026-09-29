@@ -199,19 +199,28 @@ allow — bf16 there is for conversions, dot products and cooperative matrices
 only — so those shaders are invalid on any Vulkan driver, and NVIDIA's segfaults
 compiling them rather than rejecting them. On ROCm it compiles through LLVM,
 whose lowering has no bf16 type at all, and Metal's backend reports none. f16
-holds the model: the largest value in a 1.7B prefill is 9.6e3, against the 6.5e4
-f16 reaches. A device without f16 gets f32. On Vulkan the codec decoder's
-convolutions run in f16 too, with everything around them in f32: a Vulkan device
-computes f32 convolutions without its matrix units, and on an RTX 3090 that left
-the codec alone slower than real time, 2.9 seconds of decoding for every 2 of
-audio. In f16 they take 0.1 seconds. f16 has the 10-bit mantissa of the TF32
-that CUDA runs them at, and the decoded audio stays 52 to 65 dB from an f32
-decode, around 60, where the decoder's own noise is 65.
+holds the talker: the largest value in a 1.7B prefill is 9.6e3, against the
+6.5e4 f16 reaches. The code predictor does not: the first pass of the 0.6B
+checkpoints' puts 1.46e5 into one of its MLPs, so in f16 it carries its residual
+stream at 1/32 of its value, which its normalizations, their epsilon scaled
+alike, cannot tell from the real thing. A device without f16 gets f32. On Vulkan
+the codec decoder's convolutions run in f16 too, with everything around them in
+f32: a Vulkan device computes f32 convolutions without its matrix units, and on
+an RTX 3090 that left the codec alone slower than real time, 2.9 seconds of
+decoding for every 2 of audio. In f16 they take 0.1 seconds. f16 has the 10-bit
+mantissa of the TF32 that CUDA runs them at, and the decoded audio stays 52 to
+65 dB from an f32 decode, around 60, where the decoder's own noise is 65.
 
 Measured on the RTX 3090 with NVIDIA's 610.57.04 driver, the 1.7B CustomVoice
 model on Vulkan synthesizes at 3.0 to 3.5x real time, against 3.7 to 4.2x on
 CUDA. Its first load, with its own kernel cache and the driver's shader cache
 both empty, takes about two minutes.
+
+On an AMD BC-250 (gfx1013, an RDNA2 part with no matrix units), the 0.6B
+CustomVoice model synthesizes at 1.2x real time on Vulkan and 0.3x on ROCm:
+ROCm's compiler makes the talker and the code predictor four to six times slower
+than Vulkan's on the same card. The daemon ranks ROCm above Vulkan all the same,
+which on a card like this one picks the slower of the two.
 
 Weights are downloaded by the daemon before the first load. This process has no
 network at all — it runs with `PrivateNetwork=yes` and a read-only backend
