@@ -28,8 +28,7 @@ use std::marker::PhantomData;
     feature = "rocm",
     feature = "metal",
     feature = "vulkan",
-    feature = "wgpu",
-    feature = "cpu"
+    feature = "wgpu"
 )))]
 pub trait SamplingBackend: burn::backend::Backend {
     /// Draws a token out of `logits` (vocab,) divided by `temperature`, with `noise` (vocab,)

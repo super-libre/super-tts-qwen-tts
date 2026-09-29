@@ -71,17 +71,20 @@ pub mod sampling;
     feature = "rocm",
     feature = "metal",
     feature = "vulkan",
-    feature = "wgpu",
-    feature = "cpu"
+    feature = "wgpu"
 ))]
 pub mod sampling_kernel;
 pub mod speaker_encoder;
 pub mod speech_tokenizer;
 pub mod transformer;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use burn::nn::{LinearConfig, LinearLayout};
+use burn::tensor::{DType, TensorData, bf16, f16};
 use burn_store::burn_pack::Tensor as PackTensor;
-use burn_store::{ModuleAdapter, ModuleContext};
+use burn_store::{ModuleAdapter, ModuleContext, bridge};
 
 /// The configuration of every linear layer of this example: the weight keeps the column-major,
 /// `[d_output, d_input]` layout of the checkpoints.
@@ -94,6 +97,79 @@ use burn_store::{ModuleAdapter, ModuleContext};
 /// rate by 2x.
 pub(crate) fn linear_config(d_input: usize, d_output: usize) -> LinearConfig {
     LinearConfig::new(d_input, d_output).with_layout(LinearLayout::Col)
+}
+
+/// Counts a checkpoint's bytes into `read` as each tensor's are drawn, which
+/// is how far a load has got. First in the chain, so it counts what the file
+/// holds rather than what a cast turns it into.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadCounter(pub Arc<AtomicU64>);
+
+impl ModuleAdapter for ReadCounter {
+    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+        let read = Arc::clone(&self.0);
+        let bytes = tensor.byte_len() as u64;
+        let (name, dtype, shape) = (tensor.name.clone(), tensor.dtype, tensor.shape.clone());
+        bridge::map_data(tensor, name, dtype, shape, move |data| {
+            read.fetch_add(bytes, Ordering::Relaxed);
+            data
+        })
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
+
+/// Casts the checkpoint's bf16 weights to f16 on every core, when f16 is what
+/// the talker runs in.
+///
+/// burn-store's `FloatCastAdapter` converts one element at a time on one
+/// thread, which cost Voxtral 8 s a load and the 1.7B talker about 3. The
+/// arithmetic is the same — through f32, rounding to nearest even — so the
+/// weights come out bit for bit as they did. Any other tensor is left to the
+/// `FloatCastAdapter` after it. Taken from super-stt-voxtral, whose bf16 to f32
+/// counterpart gained nothing over Burn's, so there is none.
+#[derive(Debug, Clone)]
+pub(crate) struct HalfCast {
+    pub target: DType,
+}
+
+impl ModuleAdapter for HalfCast {
+    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+        if self.target != DType::F16 || tensor.dtype != DType::BF16 {
+            return tensor;
+        }
+        let (name, shape) = (tensor.name.clone(), tensor.shape.clone());
+        bridge::map_data(tensor, name, DType::F16, shape, |data| bf16_to_f16(&data))
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
+
+/// Below this many elements a tensor is converted on the calling thread.
+const PARALLEL_CAST_MIN: usize = 1 << 16;
+
+fn bf16_to_f16(data: &TensorData) -> TensorData {
+    let source = data.as_slice::<bf16>().expect("a bf16 tensor holds bf16");
+    let mut out = vec![f16::ZERO; source.len()];
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(source.len().div_ceil(PARALLEL_CAST_MIN))
+        .max(1);
+    let chunk = source.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (from, to) in source.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            scope.spawn(move || {
+                for (value, cast) in from.iter().zip(to) {
+                    *cast = f16::from_f32(value.to_f32());
+                }
+            });
+        }
+    });
+    TensorData::new(out, data.shape.clone())
 }
 
 /// Loads the PyTorch checkpoints into modules built with [`linear_config`].
@@ -184,4 +260,29 @@ pub(crate) fn test_device() -> burn::prelude::Device {
     return burn::prelude::Device::cuda(0);
     #[cfg(not(feature = "cuda"))]
     burn::prelude::Device::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_parallel_cast_matches_burns_bit_for_bit() {
+        // Every bf16 bit pattern, several times over so the cast is split
+        // across threads: normals, subnormals, values past f16's range, both
+        // infinities and NaNs.
+        let values: Vec<bf16> = (0..4 * 65_536_u32)
+            .map(|bits| bf16::from_bits(u16::try_from(bits % 65_536).unwrap()))
+            .collect();
+        let data = TensorData::new(values, [4, 65_536]);
+        let ours = bf16_to_f16(&data);
+        let burns = data.convert_dtype(DType::F16);
+        assert_eq!(ours.shape, burns.shape);
+        let ours = ours.as_slice::<f16>().unwrap();
+        let burns = burns.as_slice::<f16>().unwrap();
+        for (i, (a, b)) in ours.iter().zip(burns).enumerate() {
+            let same = a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+            assert!(same, "element {i}: {a} against {b}");
+        }
+    }
 }

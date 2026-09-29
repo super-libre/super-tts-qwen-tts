@@ -260,6 +260,8 @@ pub struct TransformerState {
     /// `0..capacity`, for a fixed cache: what a token's position is compared with to mask the
     /// cache positions after it.
     positions: Option<Tensor<1, Int>>,
+    /// Whether the passes over this state are captured, see [`Self::for_capture`].
+    captured: bool,
     sliding_window: Option<usize>,
     dtype: DType,
     device: Device,
@@ -277,6 +279,7 @@ impl TransformerState {
             ),
             caches: vec![KvCache::Growing(None); cfg.num_hidden_layers],
             positions: None,
+            captured: false,
             sliding_window: cfg.sliding_window,
             dtype,
             device: device.clone(),
@@ -304,6 +307,15 @@ impl TransformerState {
             .collect();
         state.positions = Some(Tensor::arange(0..capacity as i64, device));
         state
+    }
+
+    /// Marks a fixed state as one whose passes of several tokens are captured, which makes
+    /// them mask causally without the upload a capture on wgpu cannot hold, see
+    /// [`Self::attention_bias`].
+    pub fn for_capture(mut self) -> Self {
+        assert!(self.positions.is_some(), "only a fixed state is captured");
+        self.captured = true;
+        self
     }
 
     /// The number of positions of the fixed caches.
@@ -353,42 +365,82 @@ impl TransformerState {
     }
 
     /// What a forward pass over `seq_len` tokens starting at `offset` takes from the state: the
-    /// attention mask, the rotary rows of its positions and the per-layer caches.
+    /// attention bias, the rotary rows of its positions and the per-layer caches.
     pub(crate) fn step(
         &mut self,
         seq_len: usize,
         offset: usize,
-    ) -> (Option<Tensor<4, Bool>>, RotarySlice, &mut [KvCache]) {
-        let mask = self.attention_mask(seq_len, offset);
+    ) -> (Option<Tensor<4>>, RotarySlice, &mut [KvCache]) {
+        let bias = self.attention_bias(seq_len, offset);
         let rotary = self.rotary_emb.slice(offset, seq_len);
-        (mask, rotary, self.caches.as_mut_slice())
+        (bias, rotary, self.caches.as_mut_slice())
     }
 
-    /// Additive attention mask of shape (1, 1, seq_len, offset + seq_len), `-inf` on the
-    /// positions a query must not attend to.
+    /// Additive attention bias of shape (1, 1, seq_len, offset + seq_len) in the state's
+    /// dtype: 0 on the keys a query may attend to, `-inf` on the others.
+    ///
+    /// A bias rather than a boolean mask: on ROCm, Burn's attention with a boolean mask is
+    /// wrong whatever the mask holds — 0.3 to 3.9 off with every key open, on an AMD BC-250
+    /// (gfx1013) — where a bias, and the causal flag, match softmax(q kᵀ/√d) v to 1e-6.
     ///
     /// The reference implementation lets a query attend to the keys `j` such that
     /// `i - j < w`, i.e. the window covers `w` keys including the query itself.
-    fn attention_mask(&self, seq_len: usize, offset: usize) -> Option<Tensor<4, Bool>> {
-        // Without a sliding window the causal flag of the attention op is all that is needed.
-        let window = self.sliding_window?.saturating_sub(1);
+    ///
+    /// Without a sliding window the causal flag of the attention op is all that is needed,
+    /// except in a captured pass, see [`Self::for_capture`]. Where the attention op runs its
+    /// fallback, as it does on wgpu, the flag has it build the mask out of two `arange`s
+    /// uploaded from the host, and a wgpu capture records dispatches only: the upload fails
+    /// the capture. A fixed cache holds its positions on the device already, so the bias is
+    /// built from them there instead. A single query needs none, which keeps it on
+    /// [`Attention::decode`].
+    fn attention_bias(&self, seq_len: usize, offset: usize) -> Option<Tensor<4>> {
+        let Some(window) = self.sliding_window else {
+            if !self.captured || seq_len == 1 {
+                return None;
+            }
+            let positions = self.positions.as_ref()?;
+            let kv_len = offset + seq_len;
+            let queries = positions
+                .clone()
+                .narrow(0, offset, seq_len)
+                .reshape([seq_len, 1])
+                .expand([seq_len, kv_len]);
+            let keys = positions
+                .clone()
+                .narrow(0, 0, kv_len)
+                .reshape([1, kv_len])
+                .expand([seq_len, kv_len]);
+            // `-1e9` rather than `-inf`, as in [`Self::mask`], so that the open keys' product
+            // stays 0. The cast takes it to `-inf` in f16, whose range it exceeds.
+            return Some(
+                keys.greater(queries)
+                    .float()
+                    .mul_scalar(-1e9)
+                    .cast(self.dtype)
+                    .reshape([1, 1, seq_len, kv_len]),
+            );
+        };
+        let window = window.saturating_sub(1);
         let kv_len = offset + seq_len;
-        let mask: Vec<bool> = (0..seq_len)
+        let bias: Vec<f32> = (0..seq_len)
             .flat_map(|i| {
                 (0..kv_len).map(move |j| {
                     let causal = j <= i + offset;
                     // Within the window iff `(i + offset) - j <= w`, rearranged to
                     // `j + w >= i + offset` to stay in `usize`.
                     let in_window = j + window >= i + offset;
-                    // `true` marks the positions the query must not attend to.
-                    !(causal && in_window)
+                    if causal && in_window {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
                 })
             })
             .collect();
-        Some(Tensor::<4, Bool>::from_data(
-            TensorData::new(mask, [1, 1, seq_len, kv_len]),
-            &self.device,
-        ))
+        Some(
+            Tensor::<4>::from_data(TensorData::new(bias, [1, 1, seq_len, kv_len]), &self.device)
+                .cast(self.dtype),
+        )
     }
 }
 
@@ -482,7 +534,7 @@ impl Attention {
     pub(crate) fn forward(
         &self,
         xs: Tensor<3>,
-        mask: Option<&Tensor<4, Bool>>,
+        bias: Option<&Tensor<4>>,
         rotary: &RotarySlice,
         cache: &mut KvCache,
         step: Step<'_>,
@@ -515,7 +567,7 @@ impl Attention {
 
         let out = if let Step::Dynamic { mask, .. } = step {
             self.decode(q, k, v, Some(mask))
-        } else if l == 1 && mask.is_none() {
+        } else if l == 1 && bias.is_none() {
             self.decode(q, k, v, None)
         } else {
             let k = repeat_kv(k, self.num_kv_groups);
@@ -524,13 +576,14 @@ impl Attention {
             // One fused kernel rather than a matmul/softmax/matmul chain. Leaving `scale` unset
             // keeps the default `1/sqrt(head_dim)` and the flash-attention path; the causal
             // flag aligns on the bottom right corner, which is what a query attending to a
-            // whole key/value cache needs.
+            // whole key/value cache needs. A bias takes the matmul/softmax/matmul chain
+            // instead, as the flash kernels have no input for one.
             let options = AttentionModuleOptions {
                 scale: None,
                 softcap: None,
-                is_causal: mask.is_none(),
+                is_causal: bias.is_none(),
             };
-            attention(q, k, v, mask.cloned(), None, options)
+            attention(q, k, v, None, bias.cloned(), options)
                 .swap_dims(1, 2)
                 .reshape([b, l, self.num_heads * self.head_dim])
         };
@@ -622,7 +675,7 @@ impl DecoderLayer {
     fn forward(
         &self,
         xs: Tensor<3>,
-        mask: Option<&Tensor<4, Bool>>,
+        bias: Option<&Tensor<4>>,
         rotary: &RotarySlice,
         cache: &mut KvCache,
         step: Step<'_>,
@@ -630,7 +683,7 @@ impl DecoderLayer {
         let residual = xs.clone();
         let hidden =
             self.self_attn
-                .forward(self.input_layernorm.forward(xs), mask, rotary, cache, step);
+                .forward(self.input_layernorm.forward(xs), bias, rotary, cache, step);
         let hidden = match &self.self_attn_layer_scale {
             Some(layer_scale) => layer_scale.forward(hidden),
             None => hidden,
@@ -675,12 +728,12 @@ impl Transformer {
     /// per-layer caches of `state`, so consecutive calls must use increasing offsets.
     pub fn forward(&self, xs: Tensor<3>, offset: usize, state: &mut TransformerState) -> Tensor<3> {
         let [_b, seq_len, _] = xs.dims();
-        let mask = state.attention_mask(seq_len, offset);
+        let bias = state.attention_bias(seq_len, offset);
         let rotary = state.rotary_emb.slice(offset, seq_len);
         let mut xs = xs;
         let step = Step::Static { offset };
         for (layer, cache) in self.layers.iter().zip(state.caches.iter_mut()) {
-            xs = layer.forward(xs, mask.as_ref(), &rotary, cache, step);
+            xs = layer.forward(xs, bias.as_ref(), &rotary, cache, step);
         }
         self.norm.forward(xs)
     }
@@ -703,5 +756,108 @@ impl Transformer {
             xs = layer.forward(xs, None, &rotary, cache, step);
         }
         self.norm.forward(xs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::Distribution;
+
+    fn tiny_config(sliding_window: Option<usize>) -> TransformerConfig {
+        TransformerConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.,
+            max_position_embeddings: 16,
+            hidden_act: Activation::Silu,
+            attention_bias: false,
+            qk_norm: true,
+            layer_scale: false,
+            sliding_window,
+        }
+    }
+
+    fn values(bias: Tensor<4>) -> Vec<f32> {
+        bias.into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .unwrap()
+    }
+
+    /// A query at position `i + offset` sees the keys up to itself, and within a window of
+    /// `w` only the `w` most recent of them.
+    #[test]
+    fn a_window_hides_the_keys_after_the_query_and_before_the_window() {
+        let device = crate::qwen3::test_device();
+        let state = TransformerState::new(&tiny_config(Some(3)), DType::F32, &device);
+        let (seq_len, offset) = (4, 2);
+        let bias = state.attention_bias(seq_len, offset).unwrap();
+        assert_eq!(bias.dims(), [1, 1, seq_len, offset + seq_len]);
+        let bias = values(bias);
+        for i in 0..seq_len {
+            let query = i + offset;
+            for j in 0..offset + seq_len {
+                let open = j <= query && query - j < 3;
+                let value = bias[i * (offset + seq_len) + j];
+                assert_eq!(
+                    value,
+                    if open { 0.0 } else { f32::NEG_INFINITY },
+                    "{query} -> {j}"
+                );
+            }
+        }
+    }
+
+    /// Only a captured pass of several tokens is biased; the others take the causal flag.
+    #[test]
+    fn a_captured_pass_masks_the_keys_after_each_query() {
+        let device = crate::qwen3::test_device();
+        let cfg = tiny_config(None);
+        assert!(
+            TransformerState::new(&cfg, DType::F32, &device)
+                .attention_bias(3, 2)
+                .is_none()
+        );
+        let state = TransformerState::new_fixed(&cfg, 1, 8, DType::F32, &device).for_capture();
+        assert!(state.attention_bias(1, 2).is_none());
+        let (seq_len, offset) = (3, 2);
+        let bias = values(state.attention_bias(seq_len, offset).unwrap());
+        for i in 0..seq_len {
+            for j in 0..offset + seq_len {
+                let value = bias[i * (offset + seq_len) + j];
+                if j <= i + offset {
+                    assert_eq!(value, 0.0, "{i} -> {j}");
+                } else {
+                    assert!(value <= -1e9, "{i} -> {j}: {value}");
+                }
+            }
+        }
+    }
+
+    /// The bias a captured pass attends through gives what the causal flag gives.
+    #[test]
+    fn a_captured_pass_matches_the_causal_flag() {
+        let device = crate::qwen3::test_device();
+        let cfg = tiny_config(None);
+        let transformer = Transformer::init(&cfg, &device);
+        let xs = Tensor::<3>::random([1, 3, cfg.hidden_size], Distribution::Default, &device);
+        let mut causal = TransformerState::new(&cfg, DType::F32, &device);
+        let mut captured =
+            TransformerState::new_fixed(&cfg, 1, 8, DType::F32, &device).for_capture();
+        let expected = values(
+            transformer
+                .forward(xs.clone(), 0, &mut causal)
+                .unsqueeze::<4>(),
+        );
+        let actual = values(transformer.forward(xs, 0, &mut captured).unsqueeze::<4>());
+        for (e, a) in expected.iter().zip(&actual) {
+            assert!((e - a).abs() < 1e-5, "{e} vs {a}");
+        }
     }
 }

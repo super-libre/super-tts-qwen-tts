@@ -9,7 +9,7 @@
     version = "0.1.0"
     edition = "2024"
     description = "Qwen text-to-speech backend for Super TTS."
-    repository = "https://github.com/jorge-menjivar/super-tts-qwen-tts"
+    repository = "https://github.com/super-libre/super-tts-qwen-tts"
     license = "GPL-3.0-only"
     publish = false
 
@@ -27,11 +27,20 @@
     # `POST /v1/voices` carries its reference clip as base64 inside the JSON
     # body, which is the only place this backend meets the encoding.
     base64 = "0.22"
+    # The binary's build ID, which CubeCL keys its compiled kernels on: the
+    # warm marker in `model.rs` goes by the same key. Already in the graph
+    # through CubeCL.
+    buildid = "1"
     bytes = "1"
     # The model in `src/qwen3` is Burn's, vendored from this fork's `qwen3-tts`
     # example (see that module's provenance note). Burn is pinned by revision:
     # the model needs six fixes to Burn's fusion crates that are not upstream
-    # yet, and `burn` has no stability guarantee between revisions anyway.
+    # yet, and `burn` has no stability guarantee between revisions anyway. Two
+    # more ride on this revision: `into_data` reads the device when it is
+    # called, where a fused in-place op on the tensor's next use could
+    # overwrite the bytes before a lazy read, and `memory_cleanup` under fusion
+    # drains the calling stream first, where it freed nothing dropped since the
+    # last sync.
     #
     # Burn is what buys this backend ROCm and Vulkan, which candle cannot
     # reach at all — CubeCL compiles every kernel at runtime for whatever
@@ -39,26 +48,26 @@
     # generation instead of one per CUDA compute capability.
     burn = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["default", "cubecl", "extension"]
     }
     burn-cubecl = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["default"]
     }
     burn-fusion = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["default"]
     }
     burn-ir = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e"
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989"
     }
     burn-store = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "9cd83cc49275b12a9ed982e6be921d15f693b24e",
+        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
         features = ["std", "safetensors"]
     }
     # Same revision Burn pins, so one CubeCL is built rather than two.
@@ -93,12 +102,17 @@
     # `ServiceExt::oneshot` for in-process router tests.
     tower = { version = "0.5", features = ["util"] }
 
-# One accelerator per build, as the asset it ships in declares. `flex` is the
-# default because it is the one that runs anywhere: a pure-Rust CPU backend
-# with nothing to detect and no driver to find.
+# One accelerator per build, as the asset it ships in declares, and every one
+# of them a GPU: the models are too big for a CPU to run at a useful speed, the
+# 1.7B talker generating about one frame of audio every ten seconds. `vulkan`
+# is the default because it is the one that builds anywhere: no SDK, and the
+# loader is found at runtime.
+#
+# `flex`, a pure-Rust CPU backend, is not shipped and not a way to run the
+# model. It is what the tests run on, so that CI checks the transformer, the
+# codec and the sampler without a GPU; `just test` selects it.
 [features]
-    default = ["flex"]
-    cpu = ["burn/cpu"]
+    default = ["vulkan"]
     cuda = ["burn/cuda"]
     flex = ["burn/flex"]
     metal = ["burn/metal"]
@@ -115,13 +129,14 @@
 # own manifest does not reach a build that merely depends on Burn — patches
 # come from the root of the crate being built — so this backend has to repeat
 # it, or it would build a different CubeCL than the branch was measured on.
-# Three commits ride on it: compiled kernels kept across runs by default, the
+# Four commits ride on it: compiled kernels kept across runs by default, the
 # sliced memory pool coalescing its free slices lazily rather than on every
-# free, and the channel server taking a partial batch when its producer pauses
-# — which is every frame of a stream.
+# free, the channel server taking a partial batch when its producer pauses
+# — which is every frame of a stream — and a CPU-backend read returning a copy
+# rather than a live view.
 [patch."https://github.com/tracel-ai/cubecl"]
-    cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
-    cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "290c77ef3a2b66b650dc345fc3452c141fc0dd3e" }
+    cubecl = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-common = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-environment = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-ir = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }
+    cubecl-zspace = { git = "https://github.com/jorge-menjivar/cubecl", rev = "46f7861b8e941823bcff79238b5181f78c6364dd" }

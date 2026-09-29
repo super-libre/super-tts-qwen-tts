@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::frames;
 use crate::model::{Outcome, Prepared, QwenTts, RequestError};
 use crate::model_thread::ModelThread;
+use crate::progress::Report;
 use crate::voices::{self, Requested};
 
 /// Where the model is in its lifecycle, as `GET /v1/status` reports it.
@@ -24,8 +25,8 @@ use crate::voices::{self, Requested};
 enum LoadState {
     /// Serving, but no model has been asked for yet.
     Starting,
-    /// A `POST /v1/load` is in flight.
-    Loading,
+    /// A `POST /v1/load` is in flight, and has got as far as this.
+    Loading(Report),
     /// Ready to synthesize.
     Ready { model: String, device: String },
     /// The load failed; the reason reaches the user through the daemon.
@@ -64,6 +65,15 @@ impl AppState {
         *guard = next;
     }
 
+    /// Record how far a load has got, unless it is over: a sample the sampler
+    /// took just before the load ended must not turn the state back.
+    fn report(&self, report: Report) {
+        let mut guard = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if let LoadState::Loading(current) = &mut *guard {
+            *current = report;
+        }
+    }
+
     fn state(&self) -> LoadState {
         self.state
             .read()
@@ -96,7 +106,19 @@ async fn ping() -> Json<Value> {
 async fn status(State(s): State<Arc<AppState>>) -> Json<Value> {
     Json(match s.state() {
         LoadState::Starting => json!({ "status": "success", "state": "starting" }),
-        LoadState::Loading => json!({ "status": "success", "state": "loading" }),
+        LoadState::Loading(report) => {
+            let mut out = json!({ "status": "success", "state": "loading" });
+            if let Some(phase) = report.phase {
+                out["phase"] = json!(phase.as_str());
+            }
+            if let Some(step) = report.step {
+                out["step"] = json!(step.as_str());
+            }
+            if let Some(progress) = report.progress {
+                out["progress"] = json!(progress);
+            }
+            out
+        }
         LoadState::Ready { model, device } => json!({
             "status": "success",
             "state": "ready",
@@ -141,12 +163,28 @@ async fn load(State(s): State<Arc<AppState>>, body: Option<Json<LoadRequest>>) -
         return json_error(StatusCode::BAD_REQUEST, "invalid_model", "no model name");
     };
 
-    s.set_state(LoadState::Loading);
+    s.set_state(LoadState::Loading(Report::default()));
     let state = Arc::clone(&s);
     let device = req.device.clone();
 
     let queued = s.model.submit(move |slot| {
-        match QwenTts::load(&state.backend_dir, &name, device.as_deref()) {
+        // The old model goes first, so the two are never resident together.
+        *slot = None;
+        let report = |report: Report| state.report(report);
+        // Caught here as well as by the model thread, because only here can a
+        // panic still be reported as the failed load it is: left to the
+        // thread, the state would stay `loading` and the daemon would wait out
+        // its timeout for a load that ended long before.
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            QwenTts::load(&state.backend_dir, &name, device.as_deref(), &report)
+        }))
+        .unwrap_or_else(|panic| {
+            Err(anyhow::anyhow!(
+                "the load panicked: {}",
+                panic_message(&*panic)
+            ))
+        });
+        match loaded {
             Ok(model) => {
                 let device = model.device_name().to_string();
                 *slot = Some(model);
@@ -179,6 +217,15 @@ async fn load(State(s): State<Arc<AppState>>, body: Option<Json<LoadRequest>>) -
         Json(json!({ "status": "success", "message": "Loading started" })),
     )
         .into_response()
+}
+
+/// What a panic said, when it said it with a string, as `panic!` does.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 async fn cancel(State(s): State<Arc<AppState>>) -> Json<Value> {
@@ -679,6 +726,57 @@ mod tests {
         assert!(body.get("model").is_none(), "no model has been asked for");
     }
 
+    /// `phase`, `step` and `progress` are part of a load, and only of one: a
+    /// sample taken just as the load ended must not bring them back.
+    #[tokio::test]
+    async fn status_reports_load_progress_only_while_loading() {
+        use crate::progress::{Phase, Step};
+
+        let (_, state) = app();
+        let status = |state: &Arc<AppState>| {
+            let req = Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap();
+            call(router(Arc::clone(state)), req)
+        };
+        let report = Report {
+            phase: Some(Phase::InitialSetup),
+            step: Some(Step::BuildingKernels),
+            progress: Some(0.5),
+        };
+        state.set_state(LoadState::Loading(Report::default()));
+        state.report(report);
+        let (_, body) = status(&state).await;
+        assert_eq!(body["state"], "loading");
+        assert_eq!(body["phase"], "initial_setup");
+        assert_eq!(body["step"], "building_kernels");
+        assert_eq!(body["progress"], 0.5);
+
+        state.set_state(LoadState::Ready {
+            model: "m".to_string(),
+            device: "cpu".to_string(),
+        });
+        state.report(report);
+        let (_, body) = status(&state).await;
+        assert_eq!(body["state"], "ready");
+        for field in ["phase", "step", "progress"] {
+            assert!(body.get(field).is_none(), "{field} outside a load: {body}");
+        }
+    }
+
+    /// A load that panics reports what the panic said as its reason, from a
+    /// `panic!` with a literal message or with arguments alike.
+    #[test]
+    fn a_panicked_load_reports_what_the_panic_said() {
+        let reason = |run: fn()| {
+            let panic = std::panic::catch_unwind(run).expect_err("it panics");
+            panic_message(&*panic).to_string()
+        };
+        assert_eq!(reason(|| panic!("boom")), "boom");
+        assert_eq!(reason(|| panic!("{} {}", "formatted", 1)), "formatted 1");
+    }
+
     /// The daemon gates synthesis on `ready`, but a race is still possible, and
     /// the contract names the code it expects to see.
     #[tokio::test]
@@ -847,7 +945,7 @@ mod tests {
         assert_eq!(body["status"], "success");
         assert!(matches!(
             state.state(),
-            LoadState::Loading | LoadState::Failed { .. }
+            LoadState::Loading(_) | LoadState::Failed { .. }
         ));
     }
 
