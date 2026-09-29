@@ -40,7 +40,9 @@
     # called, where a fused in-place op on the tensor's next use could
     # overwrite the bytes before a lazy read, and `memory_cleanup` under fusion
     # drains the calling stream first, where it freed nothing dropped since the
-    # last sync.
+    # last sync. And a dense convolution may run as a matmul over its columns,
+    # where a GPU without matrix units had only a direct kernel for it: the
+    # codec's vocoder is most of those, 13 times faster for it on an AMD BC-250.
     #
     # Burn is what buys this backend ROCm and Vulkan, which candle cannot
     # reach at all — CubeCL compiles every kernel at runtime for whatever
@@ -48,26 +50,26 @@
     # generation instead of one per CUDA compute capability.
     burn = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
+        rev = "8b232ba04c4d8bb7e8922fd88135c39aadc6c956",
         features = ["default", "cubecl", "extension"]
     }
     burn-cubecl = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
+        rev = "8b232ba04c4d8bb7e8922fd88135c39aadc6c956",
         features = ["default"]
     }
     burn-fusion = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
+        rev = "8b232ba04c4d8bb7e8922fd88135c39aadc6c956",
         features = ["default"]
     }
     burn-ir = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989"
+        rev = "8b232ba04c4d8bb7e8922fd88135c39aadc6c956"
     }
     burn-store = {
         git = "https://github.com/jorge-menjivar/burn.git",
-        rev = "1e9de733d6ff94f34c34a5765ea0b4926478f989",
+        rev = "8b232ba04c4d8bb7e8922fd88135c39aadc6c956",
         features = ["std", "safetensors"]
     }
     # Same revision Burn pins, so one CubeCL is built rather than two.
