@@ -204,6 +204,15 @@ fn ordered_key(x: f32) -> u32 {
     select(bits >> 31 != 0, !bits, bits | 0x8000_0000u32)
 }
 
+/// The index of the unit's plane in the cube, what `PLANE_POS` holds. Worked out rather than
+/// read: `CubeCL`'s AMDGPU backend, which ROCm compiles through, never sets that builtin and
+/// panics on a kernel that reads it. The cube is one-dimensional, so the plane is the unit's
+/// position over the plane size.
+#[cube]
+fn plane_pos() -> u32 {
+    UNIT_POS / PLANE_DIM
+}
+
 /// The key of the `rank`-th largest of the `vals` (`rank` counts from 1) by a radix select:
 /// every round histograms the next eight bits of the keys that share the prefix found so far,
 /// and the first plane, scanning the histogram from the top, finds the bin the rank falls in.
@@ -234,7 +243,9 @@ fn rank_key(
             }
         }
         sync_cube();
-        if PLANE_POS == 0 {
+        // The first plane, written so that the host-side expansion, where every builtin is a
+        // placeholder, can still tell this block unreachable and not flag its arithmetic.
+        if UNIT_POS < PLANE_DIM {
             // Every lane owns a run of bins, from the top down.
             let per = 256u32 / PLANE_DIM;
             let top = 255u32 - UNIT_POS_PLANE * per;
@@ -308,7 +319,9 @@ fn nucleus_key(
             }
         }
         sync_cube();
-        if PLANE_POS == 0 {
+        // The first plane, written so that the host-side expansion, where every builtin is a
+        // placeholder, can still tell this block unreachable and not flag its arithmetic.
+        if UNIT_POS < PLANE_DIM {
             let per = 256u32 / PLANE_DIM;
             let top = 255u32 - UNIT_POS_PLANE * per;
             let mut local = 0.0f32.runtime();
@@ -347,7 +360,7 @@ fn nucleus_key(
 fn cube_max(value: f32, scratch: &mut Shared<[f32]>) -> f32 {
     let m = plane_max(value);
     if UNIT_POS_PLANE == 0 {
-        scratch[PLANE_POS as usize] = m;
+        scratch[plane_pos() as usize] = m;
     }
     sync_cube();
     let planes = CUBE_DIM / PLANE_DIM;
@@ -364,7 +377,7 @@ fn cube_max(value: f32, scratch: &mut Shared<[f32]>) -> f32 {
 fn cube_sum(value: f32, scratch: &mut Shared<[f32]>) -> f32 {
     let s = plane_sum(value);
     if UNIT_POS_PLANE == 0 {
-        scratch[PLANE_POS as usize] = s;
+        scratch[plane_pos() as usize] = s;
     }
     sync_cube();
     let planes = CUBE_DIM / PLANE_DIM;
@@ -465,8 +478,8 @@ fn draw_token_kernel(
     let candidate = select(best == plane_best, best_index, 0xFFFF_FFFFu32);
     let plane_index = plane_min(candidate);
     if UNIT_POS_PLANE == 0 {
-        scratch[PLANE_POS as usize] = plane_best;
-        scratch_index[PLANE_POS as usize] = plane_index;
+        scratch[plane_pos() as usize] = plane_best;
+        scratch_index[plane_pos() as usize] = plane_index;
     }
     sync_cube();
     if UNIT_POS == 0 {
