@@ -460,9 +460,10 @@ const BUILDS_KERNELS: bool = ON_GPU;
 
 /// The entries a first load's warm-up writes to the kernel cache, tuning
 /// results and compiled kernels both: 1730 on CUDA and 724 on Vulkan, measured
-/// on an empty cache with the 1.7B CustomVoice checkpoint on an RTX 3090. ROCm
-/// is taken to be CUDA, and Metal and the generic `wgpu` to be Vulkan,
-/// unmeasured. Only the pace of the bar rides on it: past
+/// on an empty cache with the 1.7B CustomVoice checkpoint on an RTX 3090, and
+/// 644 on ROCm with 0.6B CustomVoice on an AMD BC-250 (gfx1013, which has no
+/// matrix units: a card that has them tunes more candidates). Metal and the
+/// generic `wgpu` are taken to be Vulkan, unmeasured. Only the pace of the bar rides on it: past
 /// the estimate it slows down short of the end rather than stopping, see
 /// `progress::estimate`, and a checkpoint that writes fewer ends its step
 /// early.
@@ -470,6 +471,8 @@ const WARM_UP_CACHE_ENTRIES: u64 = if !BUILDS_KERNELS {
     0
 } else if cfg!(any(feature = "vulkan", feature = "metal", feature = "wgpu")) {
     724
+} else if cfg!(feature = "rocm") {
+    644
 } else {
     1730
 };
