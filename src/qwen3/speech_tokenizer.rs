@@ -1132,8 +1132,15 @@ impl SpeechTokenizer {
     /// f16 has the 10-bit mantissa of the TF32 CUDA runs these convolutions at, and against
     /// f32 convolutions, 26 windows of that decode came out 52 to 65 dB apart, around 60,
     /// where the decoder's own noise is 65.
+    ///
+    /// The copies are weights like the ones they replace, so they go to the
+    /// persistent pool too; the replaced ones stay there, free, until the next
+    /// [`Device::memory_cleanup`].
     pub fn convolve_in(&mut self, dtype: DType) {
-        self.model.decoder.convolve_in(dtype);
+        self.device
+            .memory_persistent_allocations(&mut self.model.decoder, |decoder| {
+                decoder.convolve_in(dtype);
+            });
     }
 
     /// Loads the encoder as well as the decoder, for [`encode`](Self::encode).
@@ -1154,22 +1161,27 @@ impl SpeechTokenizer {
         read: &Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let decoder_cfg = &cfg.decoder_config;
-        let encoder = with_encoder
-            .then(|| Encoder::init(cfg, device))
-            .transpose()?;
-        let mut model = SpeechTokenizerModel {
-            decoder: Decoder::init(decoder_cfg, device),
-            encoder,
-        };
-        let mut store = SafetensorsStore::from_file(weights)
-            .with_from_adapter(
-                crate::qwen3::ReadCounter(Arc::clone(read)).chain(crate::qwen3::CheckpointAdapter),
-            )
-            .remap(remapper(cfg)?)
-            .allow_partial(true);
-        let result = model
-            .load_from(&mut store)
-            .map_err(|err| format!("failed to load {}: {err}", weights.display()))?;
+        // In the persistent pool, as the talker's are: see `Qwen3Tts::load`.
+        let (model, result) = device.memory_persistent_allocations((), |()| {
+            let encoder = with_encoder
+                .then(|| Encoder::init(cfg, device))
+                .transpose()?;
+            let mut model = SpeechTokenizerModel {
+                decoder: Decoder::init(decoder_cfg, device),
+                encoder,
+            };
+            let mut store = SafetensorsStore::from_file(weights)
+                .with_from_adapter(
+                    crate::qwen3::ReadCounter(Arc::clone(read))
+                        .chain(crate::qwen3::CheckpointAdapter),
+                )
+                .remap(remapper(cfg)?)
+                .allow_partial(true);
+            let result = model
+                .load_from(&mut store)
+                .map_err(|err| format!("failed to load {}: {err}", weights.display()))?;
+            Ok::<_, String>((model, result))
+        })?;
         crate::qwen3::check_apply_result("speech tokenizer", &result)?;
         let f32 = burn::tensor::DType::F32;
         Ok(Self {
