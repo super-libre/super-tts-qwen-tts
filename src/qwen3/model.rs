@@ -103,6 +103,19 @@ impl ResizeMlp {
     }
 }
 
+/// What the code predictor carries its residual stream at in `dtype`, see
+/// [`TransformerState::with_residual_scale`]: 1/32 in f16, as is everywhere else.
+///
+/// The first pass of the 0.6B checkpoints' code predictor, on the talker's hidden state, puts
+/// 1.46e5 into the MLP of its third layer and 5.0e4 into its residual stream, where f16 ends
+/// at 6.55e4: the pass filled with infinities, then NaNs, and every frame's codes came out as
+/// noise. At 1/32 they are 4.6e3 and 1.6e3. The talker stays under 1.4e3 unscaled. Computing
+/// the code predictor in f32 instead would cost Vulkan, whose f32 matrix products cannot use
+/// its matrix units, more than the rest of the frame.
+fn code_predictor_residual_scale(dtype: DType) -> f32 {
+    if dtype == DType::F16 { 1. / 32. } else { 1. }
+}
+
 #[derive(Module, Debug)]
 struct CodePredictorBackbone {
     /// One embedding table per predicted codebook, in the talker dimension.
@@ -566,7 +579,8 @@ impl Qwen3Tts {
                 &cfg.talker_config.code_predictor_config.transformer_config(),
                 dtype,
                 device,
-            ),
+            )
+            .with_residual_scale(code_predictor_residual_scale(dtype)),
             frame: Rc::new(RefCell::new(FrameState::new(
                 &cfg.talker_config,
                 dtype,
@@ -760,6 +774,7 @@ impl Qwen3Tts {
                 self.dtype,
                 &self.device,
             )
+            .with_residual_scale(code_predictor_residual_scale(self.dtype))
             .for_capture(),
         ));
         let passes = (0..num_passes)

@@ -262,6 +262,8 @@ pub struct TransformerState {
     positions: Option<Tensor<1, Int>>,
     /// Whether the passes over this state are captured, see [`Self::for_capture`].
     captured: bool,
+    /// What the residual stream is carried at, see [`Self::with_residual_scale`].
+    residual_scale: f32,
     sliding_window: Option<usize>,
     dtype: DType,
     device: Device,
@@ -280,6 +282,7 @@ impl TransformerState {
             caches: vec![KvCache::Growing(None); cfg.num_hidden_layers],
             positions: None,
             captured: false,
+            residual_scale: 1.,
             sliding_window: cfg.sliding_window,
             dtype,
             device: device.clone(),
@@ -316,6 +319,26 @@ impl TransformerState {
         assert!(self.positions.is_some(), "only a fixed state is captured");
         self.captured = true;
         self
+    }
+
+    /// Carries the residual stream of the passes over this state at `scale` times its value,
+    /// to keep it within the range of the dtype. RMS normalization, its epsilon scaled alike
+    /// (see [`norm_scaled`]), is blind to the scale, so every layer sees the input it would
+    /// unscaled, and its attention and MLP outputs, which have no bias, are scaled to match:
+    /// the MLP's before the product of its gate and up projections, the largest value a layer
+    /// holds. The final normalization undoes it.
+    pub fn with_residual_scale(mut self, scale: f32) -> Self {
+        self.residual_scale = scale;
+        self
+    }
+
+    /// `xs` at the scale the residual stream is carried at.
+    fn scale_residual(&self, xs: Tensor<3>) -> Tensor<3> {
+        if self.residual_scale == 1. {
+            xs
+        } else {
+            xs.mul_scalar(self.residual_scale)
+        }
     }
 
     /// The number of positions of the fixed caches.
@@ -468,11 +491,31 @@ impl Mlp {
         }
     }
 
-    fn forward(&self, xs: Tensor<3>) -> Tensor<3> {
+    /// The MLP of `xs`, times `scale`, see [`TransformerState::with_residual_scale`].
+    fn forward(&self, xs: Tensor<3>, scale: f32) -> Tensor<3> {
         let lhs = self.act_fn.forward(self.gate_proj.forward(xs.clone()));
+        let lhs = if scale == 1. {
+            lhs
+        } else {
+            lhs.mul_scalar(scale)
+        };
         let rhs = self.up_proj.forward(xs);
         self.down_proj.forward(lhs * rhs)
     }
+}
+
+/// `norm` of `xs`, a residual stream carried at `scale` times its value: what it gives the
+/// unscaled stream. That takes its epsilon scaled alike, by `scale²`, since RMS normalization is
+/// blind to the scale of its input only where the epsilon is negligible, and small inputs, such
+/// as the code predictor's embeddings, are not; otherwise Burn's `RmsNorm::forward`.
+fn norm_scaled(norm: &RmsNorm, xs: Tensor<3>, scale: f32) -> Tensor<3> {
+    if scale == 1. {
+        return norm.forward(xs);
+    }
+    let dtype = xs.dtype();
+    let epsilon = norm.epsilon * f64::from(scale).powi(2);
+    let rms = (xs.clone().cast(DType::F32).square().mean_dim(2) + epsilon).sqrt();
+    (xs / rms.cast(dtype)) * norm.gamma.val().unsqueeze()
 }
 
 /// Repeats each key/value head `n_rep` times, the grouped-query attention expansion.
@@ -679,20 +722,31 @@ impl DecoderLayer {
         rotary: &RotarySlice,
         cache: &mut KvCache,
         step: Step<'_>,
+        scale: f32,
     ) -> Tensor<3> {
         let residual = xs.clone();
-        let hidden =
-            self.self_attn
-                .forward(self.input_layernorm.forward(xs), bias, rotary, cache, step);
+        let hidden = self.self_attn.forward(
+            norm_scaled(&self.input_layernorm, xs, scale),
+            bias,
+            rotary,
+            cache,
+            step,
+        );
         let hidden = match &self.self_attn_layer_scale {
             Some(layer_scale) => layer_scale.forward(hidden),
             None => hidden,
         };
+        let hidden = if scale == 1. {
+            hidden
+        } else {
+            hidden.mul_scalar(scale)
+        };
         let xs = residual + hidden;
 
-        let hidden = self
-            .mlp
-            .forward(self.post_attention_layernorm.forward(xs.clone()));
+        let hidden = self.mlp.forward(
+            norm_scaled(&self.post_attention_layernorm, xs.clone(), scale),
+            scale,
+        );
         let hidden = match &self.mlp_layer_scale {
             Some(layer_scale) => layer_scale.forward(hidden),
             None => hidden,
@@ -730,12 +784,13 @@ impl Transformer {
         let [_b, seq_len, _] = xs.dims();
         let bias = state.attention_bias(seq_len, offset);
         let rotary = state.rotary_emb.slice(offset, seq_len);
-        let mut xs = xs;
+        let mut xs = state.scale_residual(xs);
+        let scale = state.residual_scale;
         let step = Step::Static { offset };
         for (layer, cache) in self.layers.iter().zip(state.caches.iter_mut()) {
-            xs = layer.forward(xs, bias.as_ref(), &rotary, cache, step);
+            xs = layer.forward(xs, bias.as_ref(), &rotary, cache, step, scale);
         }
-        self.norm.forward(xs)
+        norm_scaled(&self.norm, xs, scale)
     }
 
     /// Runs the stack on one token `xs` (B, 1, hidden) at the position held by `pos`, which
@@ -751,11 +806,12 @@ impl Transformer {
         let rotary = state.rotary_emb.gather(pos);
         let mask = state.mask(pos);
         let step = Step::Dynamic { pos, mask: &mask };
-        let mut xs = xs;
+        let mut xs = state.scale_residual(xs);
+        let scale = state.residual_scale;
         for (layer, cache) in self.layers.iter().zip(state.caches.iter_mut()) {
-            xs = layer.forward(xs, None, &rotary, cache, step);
+            xs = layer.forward(xs, None, &rotary, cache, step, scale);
         }
-        self.norm.forward(xs)
+        norm_scaled(&self.norm, xs, scale)
     }
 }
 
@@ -836,6 +892,38 @@ mod tests {
                 } else {
                     assert!(value <= -1e9, "{i} -> {j}: {value}");
                 }
+            }
+        }
+    }
+
+    /// A stack carried at a scale gives what it gives unscaled, small inputs included, where
+    /// the normalizations' epsilon is not negligible.
+    #[test]
+    fn a_scaled_residual_stream_gives_the_unscaled_output() {
+        let device = crate::qwen3::test_device();
+        let cfg = tiny_config(None);
+        let transformer = Transformer::init(&cfg, &device);
+        for std in [1e-3, 1.] {
+            let xs = Tensor::<3>::random(
+                [1, 3, cfg.hidden_size],
+                Distribution::Normal(0., std),
+                &device,
+            );
+            let run = |scale: f32| {
+                let mut state =
+                    TransformerState::new(&cfg, DType::F32, &device).with_residual_scale(scale);
+                values(
+                    transformer
+                        .forward(xs.clone(), 0, &mut state)
+                        .unsqueeze::<4>(),
+                )
+            };
+            let (unscaled, scaled) = (run(1.), run(1. / 32.));
+            for (u, s) in unscaled.iter().zip(&scaled) {
+                assert!(
+                    (u - s).abs() < 1e-4 * u.abs().max(1.),
+                    "std {std}: {u} vs {s}"
+                );
             }
         }
     }

@@ -204,6 +204,15 @@ fn ordered_key(x: f32) -> u32 {
     select(bits >> 31 != 0, !bits, bits | 0x8000_0000u32)
 }
 
+/// The index of the unit's plane in the cube, what `PLANE_POS` holds. Worked out rather than
+/// read: `CubeCL`'s AMDGPU backend, which ROCm compiles through, never sets that builtin and
+/// panics on a kernel that reads it. The cube is one-dimensional, so the plane is the unit's
+/// position over the plane size.
+#[cube]
+fn plane_pos() -> u32 {
+    UNIT_POS / PLANE_DIM
+}
+
 /// The key of the `rank`-th largest of the `vals` (`rank` counts from 1) by a radix select:
 /// every round histograms the next eight bits of the keys that share the prefix found so far,
 /// and the first plane, scanning the histogram from the top, finds the bin the rank falls in.
@@ -234,7 +243,9 @@ fn rank_key(
             }
         }
         sync_cube();
-        if PLANE_POS == 0 {
+        // The first plane, written so that the host-side expansion, where every builtin is a
+        // placeholder, can still tell this block unreachable and not flag its arithmetic.
+        if UNIT_POS < PLANE_DIM {
             // Every lane owns a run of bins, from the top down.
             let per = 256u32 / PLANE_DIM;
             let top = 255u32 - UNIT_POS_PLANE * per;
@@ -269,20 +280,29 @@ fn rank_key(
     prefix
 }
 
+/// What the mass histogram of [`nucleus_key`] counts the whole mass as: it sums fixed point in
+/// `u32`, because Metal has no atomic float in threadgroup memory — the kernel failed to
+/// compile there and every draw came out garbage. Normalized, no bin can hold more than the
+/// whole, so none overflows, and a unit is 1e-9 of it.
+const MASS_SCALE: f32 = 1_073_741_824.0;
+
 /// The key of the entry the nucleus ends at: the probability mass (`probs`) of the entries
 /// above it is under `target` and its own mass takes it there. The same select as
 /// [`rank_key`] over the mass instead of the count; when no entry gets there, everything is
-/// kept.
+/// kept. `probs` needs not sum to 1: `total` is what they sum to, and `target` is a share of
+/// it.
 #[cube]
 fn nucleus_key(
     vals: &Shared<[f32]>,
     probs: &Shared<[f32]>,
-    mass: &mut Shared<[Atomic<f32>]>,
+    mass: &mut Shared<[Atomic<u32>]>,
     found: &mut Shared<[u32]>,
     found_mass: &mut Shared<[f32]>,
     target: f32,
+    total: f32,
     #[comptime] vocab: usize,
 ) -> u32 {
+    let scale = MASS_SCALE / total;
     let unit = UNIT_POS as usize;
     let units = CUBE_DIM as usize;
     let mut prefix = 0u32.runtime();
@@ -291,7 +311,7 @@ fn nucleus_key(
     for round in 0..4u32 {
         let shift = 24u32 - 8u32 * round;
         for b in range_stepped(unit, 256usize, units) {
-            mass[b].store(0.0f32);
+            mass[b].store(0u32);
         }
         if UNIT_POS == 0 {
             found[0] = 0u32;
@@ -303,17 +323,19 @@ fn nucleus_key(
             if p > 0.0f32 {
                 let key = ordered_key(vals[i]);
                 if key & mask == prefix {
-                    mass[((key >> shift) & 0xFFu32) as usize].fetch_add(p);
+                    mass[((key >> shift) & 0xFFu32) as usize].fetch_add(u32::cast_from(p * scale));
                 }
             }
         }
         sync_cube();
-        if PLANE_POS == 0 {
+        // The first plane, written so that the host-side expansion, where every builtin is a
+        // placeholder, can still tell this block unreachable and not flag its arithmetic.
+        if UNIT_POS < PLANE_DIM {
             let per = 256u32 / PLANE_DIM;
             let top = 255u32 - UNIT_POS_PLANE * per;
             let mut local = 0.0f32.runtime();
             for j in 0..per {
-                local += mass[(top - j) as usize].load();
+                local += f32::cast_from(mass[(top - j) as usize].load()) / MASS_SCALE;
             }
             let above = plane_exclusive_sum(local);
             if above < remaining && remaining <= above + local {
@@ -322,7 +344,7 @@ fn nucleus_key(
                 for j in 0..per {
                     if !done {
                         let bin = top - j;
-                        let m = mass[bin as usize].load();
+                        let m = f32::cast_from(mass[bin as usize].load()) / MASS_SCALE;
                         cum += m;
                         if cum >= remaining {
                             found[0] = bin;
@@ -347,7 +369,7 @@ fn nucleus_key(
 fn cube_max(value: f32, scratch: &mut Shared<[f32]>) -> f32 {
     let m = plane_max(value);
     if UNIT_POS_PLANE == 0 {
-        scratch[PLANE_POS as usize] = m;
+        scratch[plane_pos() as usize] = m;
     }
     sync_cube();
     let planes = CUBE_DIM / PLANE_DIM;
@@ -364,7 +386,7 @@ fn cube_max(value: f32, scratch: &mut Shared<[f32]>) -> f32 {
 fn cube_sum(value: f32, scratch: &mut Shared<[f32]>) -> f32 {
     let s = plane_sum(value);
     if UNIT_POS_PLANE == 0 {
-        scratch[PLANE_POS as usize] = s;
+        scratch[plane_pos() as usize] = s;
     }
     sync_cube();
     let planes = CUBE_DIM / PLANE_DIM;
@@ -391,7 +413,7 @@ fn draw_token_kernel(
     let mut vals = Shared::<[f32]>::new_slice(vocab);
     let mut probs = Shared::<[f32]>::new_slice(vocab);
     let mut hist = Shared::<[Atomic<u32>]>::new_slice(256usize);
-    let mut mass = Shared::<[Atomic<f32>]>::new_slice(256usize);
+    let mut mass = Shared::<[Atomic<u32>]>::new_slice(256usize);
     let mut scratch = Shared::<[f32]>::new_slice(32usize);
     let mut scratch_index = Shared::<[u32]>::new_slice(32usize);
     let mut found = Shared::<[u32]>::new_slice(2usize);
@@ -437,7 +459,8 @@ fn draw_token_kernel(
                 &mut mass,
                 &mut found,
                 &mut found_mass,
-                top_p * sum,
+                top_p,
+                sum,
                 vocab,
             );
         }
@@ -465,8 +488,8 @@ fn draw_token_kernel(
     let candidate = select(best == plane_best, best_index, 0xFFFF_FFFFu32);
     let plane_index = plane_min(candidate);
     if UNIT_POS_PLANE == 0 {
-        scratch[PLANE_POS as usize] = plane_best;
-        scratch_index[PLANE_POS as usize] = plane_index;
+        scratch[plane_pos() as usize] = plane_best;
+        scratch_index[plane_pos() as usize] = plane_index;
     }
     sync_cube();
     if UNIT_POS == 0 {
