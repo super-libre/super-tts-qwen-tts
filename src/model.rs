@@ -715,6 +715,7 @@ impl QwenTts {
                 frames.load(Ordering::Relaxed),
                 warm_up_work(phase)
             );
+            model.release_memory();
             anyhow::Ok((model, warmed))
         })?;
         if warmed && let Some(marker) = marker {
@@ -869,6 +870,29 @@ impl QwenTts {
     #[must_use]
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Hand the device memory nothing holds any more back to the driver.
+    ///
+    /// Run once, when the load is done. The allocator keeps the most any work
+    /// has asked of it: the warm-up's buffers, and on a first load those of
+    /// every candidate kernel its tuning tried. The weights live in the
+    /// persistent pool, exact-fit, and nothing here touches them; the f32
+    /// convolution weights that `convolve_in` replaced with f16 copies are
+    /// freed with the rest.
+    ///
+    /// Only once: a request grows its working memory back, about 0.6 GB for
+    /// 0.6B on an RTX 3090, and keeps it for the next. Releasing it after every
+    /// request would make each sentence of an utterance allocate it again.
+    ///
+    /// Synced after. On CUDA the pages are freed in stream order, into the
+    /// driver's own pool, which hands them back to the system only at the next
+    /// synchronization.
+    fn release_memory(&self) {
+        self.device.memory_cleanup();
+        if let Err(e) = self.device.sync() {
+            log::warn!("syncing the device after releasing its memory failed: {e}");
+        }
     }
 
     /// The device the model is actually running on, as `GET /v1/status` reports it.
@@ -1497,9 +1521,12 @@ impl<'a> ChunkDecoder<'a> {
         // `decode_window` drops the context's audio itself: it was decoded only
         // so the seam between this chunk and the last one matches a single
         // decode.
-        let pcm = self
-            .speech_tokenizer
-            .decode_window(codes, context, self.window_frames);
+        let pcm = self.speech_tokenizer.decode_window(
+            codes,
+            context,
+            self.window_frames,
+            STREAM_CHUNK_FRAMES,
+        );
         self.written = frames;
         Some(pcm)
     }
@@ -1802,10 +1829,10 @@ mod tests {
         let mut time = |window: usize| {
             let context = window - STREAM_CHUNK_FRAMES;
             let prefix = &codes[..window * groups];
-            speech_tokenizer.decode_window(prefix, context, window);
+            speech_tokenizer.decode_window(prefix, context, window, STREAM_CHUNK_FRAMES);
             let started = std::time::Instant::now();
             for _ in 0..5 {
-                speech_tokenizer.decode_window(prefix, context, window);
+                speech_tokenizer.decode_window(prefix, context, window, STREAM_CHUNK_FRAMES);
             }
             started.elapsed() / 5
         };

@@ -546,19 +546,25 @@ impl Qwen3Tts {
                 cfg.talker_config.vocab_size, cfg.talker_config.codec_eos_token_id
             ));
         }
-        let mut model = Model::init(cfg, device)?;
-        let mut store = SafetensorsStore::from_file(weights)
-            .with_from_adapter(
-                crate::qwen3::ReadCounter(Arc::clone(read))
-                    .chain(crate::qwen3::CheckpointAdapter)
-                    .chain(crate::qwen3::HalfCast { target: dtype })
-                    .chain(FloatCastAdapter::to(dtype)),
-            )
-            .remap(remapper(cfg)?)
-            .allow_partial(true);
-        let mut result = model
-            .load_from(&mut store)
-            .map_err(|err| format!("failed to load {}: {err}", weights.display()))?;
+        // The weights go to the persistent pool: exact-fit allocations that live
+        // for the process. In the dynamic pools they would share pages with the
+        // activations, and a page a weight sits in can never be handed back.
+        let (mut model, mut result) = device.memory_persistent_allocations((), |()| {
+            let mut model = Model::init(cfg, device)?;
+            let mut store = SafetensorsStore::from_file(weights)
+                .with_from_adapter(
+                    crate::qwen3::ReadCounter(Arc::clone(read))
+                        .chain(crate::qwen3::CheckpointAdapter)
+                        .chain(crate::qwen3::HalfCast { target: dtype })
+                        .chain(FloatCastAdapter::to(dtype)),
+                )
+                .remap(remapper(cfg)?)
+                .allow_partial(true);
+            let result = model
+                .load_from(&mut store)
+                .map_err(|err| format!("failed to load {}: {err}", weights.display()))?;
+            Ok::<_, String>((model, result))
+        })?;
         // The configuration announces the speaker encoder; a checkpoint without any of its
         // weights loads without it, and simply cannot clone.
         let speaker_encoder = |path: &str| path.starts_with("speaker_encoder.");
