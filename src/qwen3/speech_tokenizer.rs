@@ -533,9 +533,7 @@ impl Decoder {
             // Back to front: the frames the convolutions after the transformer reach, every
             // one of the transformer's stacked windows, and the causal `pre_conv` feeding it —
             // `padding` is its left padding, in frames.
-            let after = decoder
-                .reach_after_transformer()
-                .div_ceil(decoder.total_upsample);
+            let after = decoder.reach_frames();
             let attention = cfg.num_hidden_layers * window.saturating_sub(1);
             after + attention + decoder.pre_conv.padding
         });
@@ -615,6 +613,13 @@ impl Decoder {
     /// Decodes a chunk of codes with shape (B, num_quantizers, T) into audio
     /// (B, 1, T * total_upsample).
     fn forward(&self, codes: Tensor<3, Int>, state: &mut TransformerState) -> Tensor<3> {
+        self.after_transformer(self.latents(codes, state))
+            .clamp(-1., 1.)
+    }
+
+    /// The first half of [`Self::forward`]: codes (B, num_quantizers, T) to the latents (B,
+    /// latent_dim, T) the transformer hands [`Self::after_transformer`].
+    fn latents(&self, codes: Tensor<3, Int>, state: &mut TransformerState) -> Tensor<3> {
         let nq = codes.dims()[1];
         assert_eq!(
             nq, self.num_quantizers,
@@ -623,9 +628,39 @@ impl Decoder {
         );
         let hidden = self.quantizer.decode(codes);
         let hidden = self.pre_conv.forward(hidden).swap_dims(1, 2);
-        let hidden = self.pre_transformer.forward(hidden, state);
-        self.after_transformer(hidden.swap_dims(1, 2))
-            .clamp(-1., 1.)
+        self.pre_transformer.forward(hidden, state).swap_dims(1, 2)
+    }
+
+    /// The second half of [`Self::forward`] for the frames `kept` of a window of `latents`
+    /// only, at most `chunk` of them: their samples, the same as a pass over the whole window
+    /// gives.
+    ///
+    /// Only [`convolved_span`] of the window goes through the stack after the transformer,
+    /// which is most of the decoder's work and holds its largest buffers, since it runs at
+    /// the output's sample rate. That span starts behind zeros rather than behind the frames
+    /// before it, which changes the first [`reach_frames`](Self::reach_frames) of its audio,
+    /// and those are never kept.
+    fn window_audio(
+        &self,
+        latents: Tensor<3>,
+        kept: std::ops::Range<usize>,
+        chunk: usize,
+    ) -> Tensor<3> {
+        let window = latents.dims()[2];
+        let span = convolved_span(kept.start, window, chunk, self.reach_frames());
+        let wav = self.after_transformer(latents.narrow(2, span.start, span.len()));
+        let per_frame = self.total_upsample;
+        wav.narrow(
+            2,
+            (kept.start - span.start) * per_frame,
+            kept.len() * per_frame,
+        )
+        .clamp(-1., 1.)
+    }
+
+    /// [`Self::reach_after_transformer`] in whole frames.
+    fn reach_frames(&self) -> usize {
+        self.reach_after_transformer().div_ceil(self.total_upsample)
     }
 
     /// The stack after the transformer: latents (B, latent_dim, T) to audio (B, 1, T *
@@ -1099,6 +1134,25 @@ pub struct SpeechTokenizerModel {
     encoder: Option<Encoder>,
 }
 
+/// The frames of a window of `window` that go through the decoder's stack after the
+/// transformer, which reaches `reach` frames back, when the frames from `context` on are kept,
+/// at most `chunk` of them.
+///
+/// Always `chunk + reach` frames, or the whole window if it is shorter, so every decode has
+/// one shape. They start `reach` or more frames before `context`, or at the window's start,
+/// behind the same zeros as a pass over the whole window; and they end at the window's end or
+/// before, past every frame kept.
+fn convolved_span(
+    context: usize,
+    window: usize,
+    chunk: usize,
+    reach: usize,
+) -> std::ops::Range<usize> {
+    let len = usize::min(window, chunk + reach);
+    let start = usize::min(context.saturating_sub(reach), window - len);
+    start..start + len
+}
+
 /// The speech tokenizer together with the state its transformers need.
 #[derive(Debug)]
 pub struct SpeechTokenizer {
@@ -1255,7 +1309,7 @@ impl SpeechTokenizer {
             let end = usize::min(start + chunk_size, num_frames);
             let context = usize::min(left_context, start);
             let chunk = &codes[(start - context) * num_code_groups..end * num_code_groups];
-            let wav = self.decode_window(chunk, context, left_context + chunk_size);
+            let wav = self.decode_window(chunk, context, left_context + chunk_size, chunk_size);
             pcm.extend_from_slice(&wav);
             start = end;
         }
@@ -1270,7 +1324,20 @@ impl SpeechTokenizer {
     /// decoder is causal, so the padding changes nothing in the samples returned. A GPU
     /// backend compiles and autotunes its kernels per shape, a couple of minutes each on a
     /// cold cache for this decoder, and one shape means one such cost for any stream.
-    pub fn decode_window(&mut self, codes: &[u32], context: usize, window: usize) -> Vec<f32> {
+    ///
+    /// The context is for the transformer, whose stacked attention windows reach far back
+    /// (see [`Decoder::context_frames`]). The convolutions after it reach ten frames, so only
+    /// the frames returned, at most `chunk` of them, and the ten before go through those: a
+    /// fifth of a window of 175 frames around a chunk of 25. They are where the decoder's work
+    /// and its largest buffers are, both cut by as much, and a fixed `chunk` keeps their one
+    /// shape too.
+    pub fn decode_window(
+        &mut self,
+        codes: &[u32],
+        context: usize,
+        window: usize,
+        chunk: usize,
+    ) -> Vec<f32> {
         let num_code_groups = self.num_code_groups();
         let frames = self.num_frames(codes);
         assert!(
@@ -1281,6 +1348,11 @@ impl SpeechTokenizer {
             frames <= window,
             "{frames} frames do not fit a window of {window}"
         );
+        assert!(
+            frames - context <= chunk,
+            "{} frames past the context do not fit a chunk of {chunk}",
+            frames - context
+        );
         let samples_per_frame = self.samples_per_frame();
         let padded;
         let codes = if frames < window {
@@ -1290,10 +1362,15 @@ impl SpeechTokenizer {
         } else {
             codes
         };
-        let mut wav = self.decode_chunk(codes);
-        wav.truncate(frames * samples_per_frame);
-        wav.drain(..context * samples_per_frame);
-        wav
+        let codes = self.codes_tensor(codes, window);
+        let decoder = &self.model.decoder;
+        let latents = decoder.latents(codes, &mut self.state);
+        decoder
+            .window_audio(latents, context..frames, chunk)
+            .reshape([(frames - context) * samples_per_frame])
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("the decoder returns f32 samples")
     }
 
     /// Decodes every frame of `codes` in a single pass, at whatever length they come; see
@@ -1527,6 +1604,61 @@ mod tests {
         let own =
             kicked_frame * decoder.total_upsample..(kicked_frame + 1) * decoder.total_upsample;
         assert_ne!(before[own.clone()], after[own]);
+    }
+
+    /// Every span has one length, lies inside the window, starts where the stack's reach
+    /// cannot see past it into a kept frame, and ends past the last one — for every chunk a
+    /// window can be asked for, the stream's first ones with their shorter context included.
+    #[test]
+    fn the_convolved_span_covers_every_kept_frame_past_its_reach() {
+        let reach = 10;
+        for (window, chunk) in [(175, 25), (35, 25), (30, 25), (25, 25), (60, 5)] {
+            let len = usize::min(window, chunk + reach);
+            for context in 0..window {
+                for frames in context + 1..=usize::min(window, context + chunk) {
+                    let span = convolved_span(context, window, chunk, reach);
+                    let case =
+                        format!("window {window}, chunk {chunk}, keeping {context}..{frames}");
+                    assert_eq!(span.len(), len, "{case}");
+                    assert!(span.end <= window, "{case}: {span:?}");
+                    assert!(
+                        span.start == 0 || span.start + reach <= context,
+                        "{case}: {span:?}"
+                    );
+                    assert!(frames <= span.end, "{case}: {span:?}");
+                }
+            }
+        }
+    }
+
+    /// What a window decode returns is what a pass over the whole window gives for the same
+    /// frames, though only a span of it went through the stack after the transformer.
+    #[test]
+    fn a_window_decodes_its_frames_as_a_whole_pass_does() {
+        let device = crate::qwen3::test_device();
+        let cfg = tiny_decoder_config();
+        let decoder = Decoder::init(&cfg, &device);
+        let (window, chunk) = (40, 6);
+        let latents = Tensor::<3>::random(
+            [1, cfg.latent_dim, window],
+            burn::tensor::Distribution::Uniform(-1., 1.),
+            &device,
+        );
+        let samples = |wav: Tensor<3>| wav.into_data().try_to_vec::<f32>().unwrap();
+        let whole = samples(decoder.after_transformer(latents.clone()).clamp(-1., 1.));
+        let per_frame = decoder.total_upsample;
+        // The start of the window, a context short of the stack's reach and past it, the end.
+        for (context, frames) in [(0, 6), (4, 10), (10, 16), (23, 29), (34, 40), (36, 39)] {
+            let kept = samples(decoder.window_audio(latents.clone(), context..frames, chunk));
+            let expected = &whole[context * per_frame..frames * per_frame];
+            assert_eq!(kept.len(), expected.len());
+            let diff = kept
+                .iter()
+                .zip(expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(diff < 1e-5, "frames {context}..{frames} moved by {diff}");
+        }
     }
 
     #[test]

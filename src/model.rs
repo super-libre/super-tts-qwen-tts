@@ -1521,9 +1521,12 @@ impl<'a> ChunkDecoder<'a> {
         // `decode_window` drops the context's audio itself: it was decoded only
         // so the seam between this chunk and the last one matches a single
         // decode.
-        let pcm = self
-            .speech_tokenizer
-            .decode_window(codes, context, self.window_frames);
+        let pcm = self.speech_tokenizer.decode_window(
+            codes,
+            context,
+            self.window_frames,
+            STREAM_CHUNK_FRAMES,
+        );
         self.written = frames;
         Some(pcm)
     }
@@ -1826,10 +1829,10 @@ mod tests {
         let mut time = |window: usize| {
             let context = window - STREAM_CHUNK_FRAMES;
             let prefix = &codes[..window * groups];
-            speech_tokenizer.decode_window(prefix, context, window);
+            speech_tokenizer.decode_window(prefix, context, window, STREAM_CHUNK_FRAMES);
             let started = std::time::Instant::now();
             for _ in 0..5 {
-                speech_tokenizer.decode_window(prefix, context, window);
+                speech_tokenizer.decode_window(prefix, context, window, STREAM_CHUNK_FRAMES);
             }
             started.elapsed() / 5
         };
